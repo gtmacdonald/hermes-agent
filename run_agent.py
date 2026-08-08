@@ -603,10 +603,13 @@ class AIAgent:
         Called at turn start, before expensive conversation setup.
         """
         from hermes_cli.config import load_config_readonly
-        from pathlib import Path
 
         cfg = load_config_readonly()
-        cfg_path = Path.home() / ".hermes" / "config.yaml"
+        # "model" is legitimately a bare string in the legacy/default schema
+        # (DEFAULT_CONFIG["model"] = ""); only the nested form carries
+        # default/provider. Same guard as every other model-block reader.
+        model_cfg = cfg.get("model") if isinstance(cfg.get("model"), dict) else {}
+        cfg_path = get_hermes_home() / "config.yaml"
 
         try:
             stat = cfg_path.stat()
@@ -615,8 +618,8 @@ class AIAgent:
             current_mtime = 0
 
         current_fp = (
-            cfg.get("model", {}).get("default"),
-            cfg.get("model", {}).get("provider"),
+            model_cfg.get("default"),
+            model_cfg.get("provider"),
             current_mtime,
         )
 
@@ -7875,8 +7878,11 @@ class AIAgent:
         # made by other sessions and clear stale per-session pins so this
         # session adopts the new config. Runs at turn start, before the
         # expensive conversation setup, so we don't waste tokens on a model
-        # that's about to change.
-        self._check_config_model_changed()
+        # that's about to change. getattr: harness tests drive this method
+        # with duck-typed agent stand-ins (same convention as session_id below).
+        _check_config = getattr(self, "_check_config_model_changed", None)
+        if _check_config is not None:
+            _check_config()
 
         effective_task_id = task_id or str(uuid.uuid4())
         session_id = str(getattr(self, "session_id", None) or "")

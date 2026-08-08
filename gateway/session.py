@@ -1298,52 +1298,37 @@ class SessionStore:
         except Exception as e:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
 
-        # Discard stale active-turn markers from dead sessions. A hard crash
-        # can leave markers behind with no TTL; they block live sessions from
-        # being scheduled. Run once at startup, before the first message.
-        self._discard_orphan_turn_markers()
-
-    def _discard_orphan_turn_markers(self, max_age_seconds: int = 3600) -> int:
+    def _discard_orphan_turn_markers_locked(self, max_age_seconds: int = 3600) -> int:
         """Clear active-turn markers left by dead sessions (age > max_age_seconds).
 
-        Returns the number of markers discarded. Idempotent and safe to call
-        at any time; runs under ``_lock`` so it cannot race a live turn.
+        A hard crash can leave markers behind with no TTL; they block live
+        sessions from being scheduled. Runs once at startup from
+        ``_ensure_loaded_locked`` (lock held) — NOT from ``__init__``, which
+        would eagerly load the store before callers finish wiring it
+        (e.g. swapping ``_db``) and turn the real ``_ensure_loaded`` into a
+        no-op. Returns the number of markers discarded.
         """
         import time
         now = time.time()
         discarded = 0
 
-        with self._lock:
-            self._ensure_loaded_locked()
-            for session_key, entry in list(self._entries.items()):
-                if not entry.active_turn_token:
-                    continue
+        for session_key, entry in list(self._entries.items()):
+            # getattr: tests seed _entries with duck-typed stand-ins (same
+            # defensive posture as _prune_stale_sessions_locked).
+            if not getattr(entry, "active_turn_token", None):
+                continue
 
-                started_at = entry.active_turn_started_at
-                if started_at is None:
-                    continue
+            started_at = getattr(entry, "active_turn_started_at", None)
+            if started_at is None:
+                continue
 
-                try:
-                    age_seconds = now - started_at.timestamp()
-                    if age_seconds > max_age_seconds:
-                        logger.warning(
-                            "gateway.session: discarding stale turn marker: "
-                            "session_key=%s, age=%.0fs",
-                            session_key, age_seconds,
-                        )
-                        entry.active_turn_token = None
-                        entry.active_turn_started_at = None
-                        self._save_entry(
-                            session_key,
-                            entry_data=entry.to_dict(),
-                            lock_held=True,
-                        )
-                        discarded += 1
-                except (TypeError, ValueError, OSError) as e:
+            try:
+                age_seconds = now - started_at.timestamp()
+                if age_seconds > max_age_seconds:
                     logger.warning(
-                        "gateway.session: discarding invalid turn marker: "
-                        "session_key=%s, error=%s",
-                        session_key, e,
+                        "gateway.session: discarding stale turn marker: "
+                        "session_key=%s, age=%.0fs",
+                        session_key, age_seconds,
                     )
                     entry.active_turn_token = None
                     entry.active_turn_started_at = None
@@ -1353,6 +1338,20 @@ class SessionStore:
                         lock_held=True,
                     )
                     discarded += 1
+            except (TypeError, ValueError, OSError, AttributeError) as e:
+                logger.warning(
+                    "gateway.session: discarding invalid turn marker: "
+                    "session_key=%s, error=%s",
+                    session_key, e,
+                )
+                entry.active_turn_token = None
+                entry.active_turn_started_at = None
+                self._save_entry(
+                    session_key,
+                    entry_data=entry.to_dict(),
+                    lock_held=True,
+                )
+                discarded += 1
 
         if discarded > 0:
             logger.info(
@@ -1486,6 +1485,12 @@ class SessionStore:
         # entries before the first message arrives. Pruning here (lock already
         # held) is cheap: one lookup per routing key, once at startup.
         self._prune_stale_sessions_locked()
+
+        # Same startup window, same rationale: clear active-turn markers a
+        # hard crash left behind (they'd block those sessions from being
+        # scheduled). Runs after the stale prune so ended sessions are
+        # already gone and only live entries are swept.
+        self._discard_orphan_turn_markers_locked()
 
     def _prune_stale_sessions_locked(self) -> None:
         """Remove sessions.json entries whose session has ended in state.db.
