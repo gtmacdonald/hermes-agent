@@ -74,6 +74,19 @@ cd apps/desktop
 
 Resolution order is this checkout's `venv/`, then `.venv/`, then the installed Hermes venv under `$HERMES_HOME` — each verified by actually importing `hermes_cli.config` against this checkout. Set `HERMES_DESKTOP_PYTHON` to override. Plain `npm run dev` still works when the checkout has its own venv.
 
+### Dev doesn't have my settings
+
+A dev run comes up with default appearance — no theme, no pinned projects — even though the installed app has them. Main-process state (`connection.json`, `native-theme.json`, `window-state.json`, …) lives in userData and *is* shared. Renderer preferences — skin, light/dark mode, per-profile appearance, statusbar, review layout — live in `localStorage`, which Chromium partitions by origin: the installed app loads the renderer from `file://`, dev loads it from `http://127.0.0.1:5174`. Same userData, same leveldb, two disjoint stores.
+
+Copy the installed app's half across, with the desktop **stopped** (a running app holds the leveldb lock, and dev holds port 5174):
+
+```bash
+npx electron scripts/sync-installed-settings.cjs
+./scripts/dev.sh
+```
+
+It's a one-way copy, installed → dev, of every `localStorage` key. Re-run it whenever you want to re-sync; changes you make in the dev app stay in the dev origin and never touch the installed one.
+
 Point the app at a specific source checkout, or sandbox it away from your real config:
 
 ```bash
