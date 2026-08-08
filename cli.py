@@ -28,6 +28,7 @@ import copy
 import os
 import shutil
 import sys
+import time
 import json
 import re
 import concurrent.futures
@@ -4101,15 +4102,15 @@ def _parse_skills_argument(skills: str | list[str] | tuple[str, ...] | None) -> 
 def save_config_value(key_path: str, value: any) -> bool:
     """
     Save a value to the active config file at the specified key path.
-    
+
     Respects the same lookup order as load_cli_config():
     1. ~/.hermes/config.yaml (user config - preferred, used if it exists)
     2. ./cli-config.yaml (project config - fallback)
-    
+
     Args:
         key_path: Dot-separated path like "agent.system_prompt"
         value: Value to save
-    
+
     Returns:
         True if successful, False otherwise
     """
@@ -4127,32 +4128,79 @@ def save_config_value(key_path: str, value: any) -> bool:
     # setting silently vanished every restart on any install whose
     # HERMES_HOME/config.yaml didn't exist yet.
     config_path = get_hermes_home() / 'config.yaml'
-    
+
     try:
         # Ensure parent directory exists (for ~/.hermes/config.yaml on first use)
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Save back atomically while preserving comments, ordering, quotes, and
-        # readable Unicode in user-edited config.yaml.
-        from utils import atomic_roundtrip_yaml_update
-        atomic_roundtrip_yaml_update(config_path, key_path, value)
-        
-        # Enforce owner-only permissions on config files (contain API keys)
+
+        # Inter-process advisory lock to prevent concurrent config writes.
+        # Two sessions can read the same config, modify different keys, and
+        # race to write — the second write silently clobbers the first's
+        # changes. The lock serializes the read-modify-write cycle.
+        lock_path = config_path.parent / 'config.yaml.lock'
+        lock_file = None
+        lock_acquired = False
         try:
-            os.chmod(config_path, 0o600)
-        except (OSError, NotImplementedError):
-            pass
+            import fcntl
+            lock_file = open(lock_path, 'w')
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_acquired = True
+            except (IOError, OSError):
+                # Spin-wait up to ~50ms for the lock
+                for _ in range(5):
+                    time.sleep(0.01)
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        lock_acquired = True
+                        break
+                    except (IOError, OSError):
+                        pass
+            if not lock_acquired:
+                logger.warning(
+                    "Config write lock busy for %s; proceeding without lock (race possible)",
+                    lock_path,
+                )
+        except Exception as lock_err:
+            logger.warning("Failed to acquire config write lock: %s", lock_err)
+            lock_file = None
 
-        # Model/provider changes made through /model and the TUI use this
-        # persistence path rather than ``hermes config set``. Surface the same
-        # fail-closed cron drift warning for every operator-facing model switch.
-        from hermes_cli.config import (
-            warn_unpinned_cron_jobs_after_model_config_change,
-        )
+        try:
+            # Save back atomically while preserving comments, ordering, quotes, and
+            # readable Unicode in user-edited config.yaml.
+            from utils import atomic_roundtrip_yaml_update
+            atomic_roundtrip_yaml_update(config_path, key_path, value)
 
-        warn_unpinned_cron_jobs_after_model_config_change(key_path, value)
-        
-        return True
+            # Enforce owner-only permissions on config files (contain API keys)
+            try:
+                os.chmod(config_path, 0o600)
+            except (OSError, NotImplementedError):
+                pass
+
+            # Invalidate in-process config caches so this session re-reads.
+            from hermes_cli.config import _CONFIG_LOCK, _LOAD_CONFIG_CACHE, _RAW_CONFIG_CACHE
+            with _CONFIG_LOCK:
+                _LOAD_CONFIG_CACHE.clear()
+                _RAW_CONFIG_CACHE.clear()
+
+            # Model/provider changes made through /model and the TUI use this
+            # persistence path rather than ``hermes config set``. Surface the same
+            # fail-closed cron drift warning for every operator-facing model switch.
+            from hermes_cli.config import (
+                warn_unpinned_cron_jobs_after_model_config_change,
+            )
+
+            warn_unpinned_cron_jobs_after_model_config_change(key_path, value)
+
+            return True
+        finally:
+            if lock_file is not None:
+                if lock_acquired:
+                    try:
+                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                    except Exception:
+                        pass
+                lock_file.close()
     except Exception as e:
         logger.error("Failed to save config: %s", e)
         return False

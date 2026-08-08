@@ -595,6 +595,52 @@ class AIAgent:
             pass_session_id=pass_session_id,
         )
 
+    def _check_config_model_changed(self) -> bool:
+        """Return True if config.yaml's model section changed since last check.
+
+        Detects global model/provider changes made by other sessions and
+        clears stale per-session pins so this session adopts the new config.
+        Called at turn start, before expensive conversation setup.
+        """
+        from hermes_cli.config import load_config_readonly
+        from pathlib import Path
+
+        cfg = load_config_readonly()
+        cfg_path = Path.home() / ".hermes" / "config.yaml"
+
+        try:
+            stat = cfg_path.stat()
+            current_mtime = stat.st_mtime_ns
+        except OSError:
+            current_mtime = 0
+
+        current_fp = (
+            cfg.get("model", {}).get("default"),
+            cfg.get("model", {}).get("provider"),
+            current_mtime,
+        )
+
+        if not hasattr(self, "_last_config_model_fp"):
+            self._last_config_model_fp = current_fp
+            return False
+
+        if self._last_config_model_fp != current_fp:
+            old_model, old_provider, _ = self._last_config_model_fp
+            new_model, new_provider, _ = current_fp
+            logger.info(
+                "Config model changed: %s/%s → %s/%s",
+                old_model, old_provider, new_model, new_provider
+            )
+            self._last_config_model_fp = current_fp
+
+            # Invalidate session-pinned overrides so new config is adopted
+            if hasattr(self, "_model_override"):
+                self._model_override = None
+
+            return True
+
+        return False
+
     def _get_session_db_for_recall(self):
         """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
 
@@ -7824,6 +7870,14 @@ class AIAgent:
             start_task_run,
         )
         from agent.subagent_lifecycle import bind_subagent_parent
+
+        # Config fingerprint validation: detect global model/provider changes
+        # made by other sessions and clear stale per-session pins so this
+        # session adopts the new config. Runs at turn start, before the
+        # expensive conversation setup, so we don't waste tokens on a model
+        # that's about to change.
+        self._check_config_model_changed()
+
         effective_task_id = task_id or str(uuid.uuid4())
         session_id = str(getattr(self, "session_id", None) or "")
         task_context = {

@@ -1298,6 +1298,69 @@ class SessionStore:
         except Exception as e:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
 
+        # Discard stale active-turn markers from dead sessions. A hard crash
+        # can leave markers behind with no TTL; they block live sessions from
+        # being scheduled. Run once at startup, before the first message.
+        self._discard_orphan_turn_markers()
+
+    def _discard_orphan_turn_markers(self, max_age_seconds: int = 3600) -> int:
+        """Clear active-turn markers left by dead sessions (age > max_age_seconds).
+
+        Returns the number of markers discarded. Idempotent and safe to call
+        at any time; runs under ``_lock`` so it cannot race a live turn.
+        """
+        import time
+        now = time.time()
+        discarded = 0
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            for session_key, entry in list(self._entries.items()):
+                if not entry.active_turn_token:
+                    continue
+
+                started_at = entry.active_turn_started_at
+                if started_at is None:
+                    continue
+
+                try:
+                    age_seconds = now - started_at.timestamp()
+                    if age_seconds > max_age_seconds:
+                        logger.warning(
+                            "gateway.session: discarding stale turn marker: "
+                            "session_key=%s, age=%.0fs",
+                            session_key, age_seconds,
+                        )
+                        entry.active_turn_token = None
+                        entry.active_turn_started_at = None
+                        self._save_entry(
+                            session_key,
+                            entry_data=entry.to_dict(),
+                            lock_held=True,
+                        )
+                        discarded += 1
+                except (TypeError, ValueError, OSError) as e:
+                    logger.warning(
+                        "gateway.session: discarding invalid turn marker: "
+                        "session_key=%s, error=%s",
+                        session_key, e,
+                    )
+                    entry.active_turn_token = None
+                    entry.active_turn_started_at = None
+                    self._save_entry(
+                        session_key,
+                        entry_data=entry.to_dict(),
+                        lock_held=True,
+                    )
+                    discarded += 1
+
+        if discarded > 0:
+            logger.info(
+                "gateway.session: discarded %d orphan turn marker(s)",
+                discarded,
+            )
+        return discarded
+
     def _has_active_processes_safe(self, session_key: str, *, context: str) -> bool:
         """Return whether a session has active work, failing closed on registry errors."""
         if self._has_active_processes_fn is None:
