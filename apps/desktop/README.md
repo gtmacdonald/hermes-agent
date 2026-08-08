@@ -61,8 +61,18 @@ Want to hack on the app itself? Install workspace deps from the repo root once, 
 ```bash
 npm install          # from repo root — links apps/desktop, web, apps/shared
 cd apps/desktop
-npm run dev          # Vite renderer + Electron, which boots the Python backend
+./scripts/dev.sh     # Vite renderer + Electron, which boots the Python backend
 ```
+
+`scripts/dev.sh` is `npm run dev` with the backend interpreter pinned first — use it in a checkout that has no `venv/`, such as a fresh `git worktree add`. Electron boots the Python backend with whatever interpreter it finds for the source root, and with no venv there that search lands on system `python3`, which has no PyYAML: the backend dies on `No module named 'yaml'` before the gateway binds a port. The scripts (macOS/Linux; on Windows use `npm run dev` in a checkout that has a venv):
+
+```bash
+./scripts/dev.sh          # start the app (renderer + Electron + backend)
+./scripts/gateway.sh      # start ONLY the backend, no Electron — when the gateway is what's broken
+./scripts/dev-python.sh   # print the interpreter the other two use, or explain why there isn't one
+```
+
+Resolution order is this checkout's `venv/`, then `.venv/`, then the installed Hermes venv under `$HERMES_HOME` — each verified by actually importing `hermes_cli.config` against this checkout. Set `HERMES_DESKTOP_PYTHON` to override. Plain `npm run dev` still works when the checkout has its own venv.
 
 Point the app at a specific source checkout, or sandbox it away from your real config:
 
@@ -176,6 +186,8 @@ release-path changes.
 ### Troubleshooting
 
 Boot logs land in `HERMES_HOME/logs/desktop.log` (includes backend output and recent Python tracebacks) — check it first if the app reports a boot failure.
+
+Running from a source checkout and the log shows `Ignoring Hermes source at …: hermes_cli is not importable`? That checkout has no usable venv, so the desktop skipped it and fell back to your installed Hermes — you're running the install's code, not your edits. Start it with [`./scripts/dev.sh`](#development) instead of `npm run dev`.
 
 **macOS / Linux:**
 

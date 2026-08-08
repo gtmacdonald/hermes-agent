@@ -3832,17 +3832,39 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
   const venvRoot = path.join(root, 'venv')
   const venvPython = getVenvPython(venvRoot)
   const command = IS_WINDOWS && fileExists(venvPython) ? venvPython : python
+  const env = buildDesktopBackendEnv({
+    hermesHome: HERMES_HOME,
+    pythonPathEntries: [root, ...getVenvSitePackagesEntries(venvRoot)],
+    venvRoot
+  })
+
+  // Same smoke-test rationale as the system-Python rung in
+  // resolveHermesBackend: a source checkout with no venv (a fresh `git
+  // worktree add` never gets one -- venv/ is gitignored) makes
+  // findPythonForRoot fall back to whatever python3 is on PATH, which
+  // usually has no PyYAML. Returning that backend hands the spawn step a
+  // guaranteed `ModuleNotFoundError: No module named 'yaml'` at
+  // hermes_cli/config.py import time, and the renderer answers a backend
+  // that dies before ready with a 3-attempt repair/reinstall loop -- so the
+  // user sees an install failure instead of "this checkout has no venv."
+  // Probe with the env the backend would actually run under so the import
+  // resolves against this root, not some other checkout's site-packages.
+  if (!canImportHermesCli(command, { env })) {
+    rememberLog(
+      `Ignoring ${label}: hermes_cli is not importable with ${command}. ` +
+        `Create a venv at ${venvRoot} (or point HERMES_DESKTOP_PYTHON at one) to run this checkout; ` +
+        'trying the next candidate.'
+    )
+
+    return null
+  }
 
   return {
     kind: 'python',
     label,
     command,
     args: ['-m', 'hermes_cli.main', ...backendArgs],
-    env: buildDesktopBackendEnv({
-      hermesHome: HERMES_HOME,
-      pythonPathEntries: [root, ...getVenvSitePackagesEntries(venvRoot)],
-      venvRoot
-    }),
+    env,
     root,
     bootstrap: Boolean(options.bootstrap),
     shell: false
