@@ -68,6 +68,7 @@ type KanbanMessages = {
   model: string
   modelInherit: string
   modelClear: string
+  modelUnavailable: string
   modelHint: string
   workspaceInherit: string
   workspaceInheritDir: (dir: string) => string
@@ -257,6 +258,7 @@ const en: KanbanMessages = {
   model: 'Model',
   modelInherit: 'Profile default',
   modelClear: 'Clear model override',
+  modelUnavailable: 'This pinned model is unavailable in the current provider catalog',
   modelHint: 'Runs this task on a specific model and thinking depth. Unset uses the assigned profile’s own.',
   workspaceInherit: 'Inherits the board’s project directory',
   workspaceInheritDir: dir => `Leave empty to inherit ${dir}`,
@@ -449,6 +451,7 @@ const ja: KanbanMessages = {
   model: 'モデル',
   modelInherit: 'プロファイル既定',
   modelClear: 'モデル指定を解除',
+  modelUnavailable: '固定したモデルは現在のプロバイダーカタログでは利用できません',
   modelHint: 'このタスクを特定のモデルと思考深度で実行します。未設定なら担当プロファイルの設定を使用します。',
   workspaceInherit: 'ボードのプロジェクトディレクトリを継承',
   workspaceInheritDir: dir => `空欄にすると ${dir} を継承します`,
@@ -639,6 +642,7 @@ const zh: KanbanMessages = {
   model: '模型',
   modelInherit: '配置文件默认',
   modelClear: '清除模型覆盖',
+  modelUnavailable: '固定的模型在当前提供商目录中不可用',
   modelHint: '让该任务使用指定的模型与思考深度。未设置时使用所指派配置文件自身的设置。',
   workspaceInherit: '继承面板的项目目录',
   workspaceInheritDir: dir => `留空则继承 ${dir}`,
@@ -827,6 +831,7 @@ const zhHant: KanbanMessages = {
   model: '模型',
   modelInherit: '設定檔預設',
   modelClear: '清除模型覆寫',
+  modelUnavailable: '固定的模型在目前的提供者目錄中不可用',
   modelHint: '讓此任務使用指定的模型與思考深度。未設定時使用所指派設定檔本身的設定。',
   workspaceInherit: '繼承面板的專案目錄',
   workspaceInheritDir: dir => `留空則繼承 ${dir}`,

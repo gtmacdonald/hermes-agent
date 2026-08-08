@@ -21,9 +21,13 @@ import {
   ModelCatalogMenu,
   ModelMenuCloseContext,
   type ModelMenuController,
-  reasoningEffortLabel
+  reasoningEffortLabel,
+  useQuery
 } from '@hermes/plugin-sdk'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+
+import { manualPickRemoved, modelOptionsQueryKey, requestModelOptions } from '@/lib/model-options'
+import type { ModelOptionProvider } from '@/types/hermes'
 
 import { useKanban } from './ui'
 
@@ -36,6 +40,19 @@ export interface TaskModelOverride {
 }
 
 export const EMPTY_OVERRIDE: TaskModelOverride = { effort: '', model: '', provider: '' }
+
+/**
+ * A warning-only catalog check for a saved card pin. It deliberately shares
+ * the composer's conservative predicate: no model, unknown provider, empty
+ * provider catalog, or a catalog not loaded yet are all insufficient evidence
+ * to call a card stale. The stored override is never changed here.
+ */
+export function isOverrideUnavailable(
+  providers: ModelOptionProvider[] | undefined,
+  value: TaskModelOverride
+): boolean {
+  return manualPickRemoved(providers, value.provider.trim(), value.model.trim())
+}
 
 /** True when nothing is pinned and the worker profile decides everything. */
 export const isInherited = (value: TaskModelOverride): boolean =>
@@ -67,13 +84,62 @@ export function ModelOverrideField({
 }) {
   const k = useKanban()
   const [open, setOpen] = useState(false)
+  // The picker already fetches this catalog, but this detached field also needs
+  // it while closed so a persisted pin can visibly warn after a provider drops
+  // a model. Same global query key means opening the menu does not fetch twice.
+  const { data: catalog } = useQuery({
+    queryKey: modelOptionsQueryKey(undefined),
+    queryFn: () => requestModelOptions({})
+  })
+  const unavailable = isOverrideUnavailable(catalog?.providers, value)
+
+  // ── one gesture, one onChange ──────────────────────────────────────────────
+  // The shared menu commits a pick as TWO controller calls: `select` (the
+  // model) then `applyPreset` (the remembered effort). The composer batches
+  // those into a single session write; here each onChange used to become its
+  // own PATCH — two racing requests with *different* bodies per click, and the
+  // loser decided what the card ran on. Coalesce every controller write made
+  // in the same tick into one merged onChange instead.
+  const pending = useRef<null | TaskModelOverride>(null)
+  const flushTimer = useRef<null | ReturnType<typeof setTimeout>>(null)
+
+  const flush = () => {
+    flushTimer.current = null
+    const next = pending.current
+    pending.current = null
+
+    if (next) {
+      onChange(next)
+    }
+  }
+
+  const commit = (patch: Partial<TaskModelOverride>) => {
+    pending.current = { ...(pending.current ?? value), ...patch }
+
+    // A macrotask, not a microtask: `applyPreset` runs in the microtask after
+    // `await controller.select(...)`, so a microtask flush would still fire
+    // between the two calls.
+    flushTimer.current ??= setTimeout(flush, 0)
+  }
+
+  // Deliver a buffered pick even if the drawer unmounts on the same click.
+  useEffect(
+    () => () => {
+      if (flushTimer.current !== null) {
+        clearTimeout(flushTimer.current)
+        flush()
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    []
+  )
 
   const controller: ModelMenuController = {
     // Picking a model seeds the depth from what the user last used for it, so
     // the board behaves like the composer. We only READ presets — a per-task
     // choice must never rewrite what the composer opens at.
     applyPreset: (preset, row) =>
-      onChange({
+      commit({
         effort: preset.effort ?? '',
         model: row.model,
         provider: row.provider
@@ -85,7 +151,7 @@ export function ModelOverrideField({
     presetFor: () => ({}),
 
     select: (model, provider) => {
-      onChange({ ...value, model, provider })
+      commit({ model, provider })
     },
 
     // Fast mode is a live-session request parameter, not something the worker
@@ -96,7 +162,7 @@ export function ModelOverrideField({
         return
       }
 
-      onChange({ effort: patch.effort, model: row.model, provider: row.provider })
+      commit({ effort: patch.effort, model: row.model, provider: row.provider })
     }
   }
 
@@ -113,6 +179,15 @@ export function ModelOverrideField({
         >
           <span className="min-w-0 truncate">{overrideLabel(value, k.modelInherit)}</span>
           <span className="flex shrink-0 items-center gap-1">
+            {unavailable && (
+              <span
+                aria-label={k.modelUnavailable}
+                className="text-amber-500"
+                title={k.modelUnavailable}
+              >
+                <Codicon name="warning" size="0.75rem" />
+              </span>
+            )}
             {!isInherited(value) && (
               <span
                 aria-label={k.modelClear}

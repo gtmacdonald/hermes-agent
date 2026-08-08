@@ -6,6 +6,7 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vite
 import {
   EMPTY_OVERRIDE,
   isInherited,
+  isOverrideUnavailable,
   overrideCreateFields,
   overrideLabel,
   overridePatch,
@@ -35,6 +36,25 @@ beforeEach(() => {
 afterEach(() => {
   cleanup()
   vi.clearAllMocks()
+})
+
+describe('override availability', () => {
+  const providers = [
+    { models: ['gpt-5.6', 'gpt-5.6-mini'], name: 'OpenAI', slug: 'openai' },
+    { models: [], name: 'Nous', slug: 'nous' }
+  ]
+
+  it('flags a pinned model dropped from its provider catalog', () => {
+    expect(isOverrideUnavailable(providers, { effort: '', model: 'gpt-retired', provider: 'openai' })).toBe(true)
+  })
+
+  it('stays quiet while catalog evidence is absent or inconclusive', () => {
+    expect(isOverrideUnavailable(providers, EMPTY_OVERRIDE)).toBe(false)
+    expect(isOverrideUnavailable(providers, { effort: '', model: 'gpt-5.6', provider: 'openai' })).toBe(false)
+    expect(isOverrideUnavailable(providers, { effort: '', model: 'x', provider: 'nous' })).toBe(false)
+    expect(isOverrideUnavailable(providers, { effort: '', model: 'x', provider: 'unknown' })).toBe(false)
+    expect(isOverrideUnavailable(undefined, { effort: '', model: 'x', provider: 'openai' })).toBe(false)
+  })
 })
 
 describe('override label', () => {

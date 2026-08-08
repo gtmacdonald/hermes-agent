@@ -45,7 +45,7 @@ import {
   taskKey,
   uploadAttachment
 } from './api'
-import { ModelOverrideField, overridePatch } from './model-override'
+import { ModelOverrideField, overridePatch, type TaskModelOverride } from './model-override'
 import {
   type Diagnostic,
   type DiagnosticAction,
@@ -588,6 +588,9 @@ export function TaskDrawer({
     void qc.invalidateQueries({ queryKey: ['kanban', 'board', slug] })
   }
 
+  // Scopes the concurrency guards in overrideMut (`qc.isMutating` counts).
+  const OVERRIDE_MUT_KEY = ['kanban', 'task-override', slug, id ?? '']
+
   // Optimistic status change against the task cache; rolls back + toasts on a
   // rejected transition (the backend enforces the workflow).
   const moveMut = useMutation({
@@ -610,6 +613,52 @@ export function TaskDrawer({
       host.notify({ kind: 'error', message: errText(err) })
     },
     onSettled: invalidate
+  })
+
+  // Optimistic model/effort override. Same shape as moveMut, and just as
+  // load-bearing: the detail query polls on an interval, so without an
+  // immediate cache write (and the cancelQueries) a poll response that was in
+  // flight during the PATCH resolves afterwards and snaps the dropdown back to
+  // the old model until the next refetch — the "picker disagrees with itself"
+  // flicker. Rollback only restores the pre-PATCH value when no newer pick has
+  // landed on top (rapid re-picking must not resurrect an older choice).
+  const overrideMut = useMutation({
+    mutationFn: (next: TaskModelOverride) => patchTask(id!, overridePatch(next)),
+    onMutate: async next => {
+      await qc.cancelQueries({ queryKey: taskKey(slug, id!) })
+      const previous = qc.getQueryData<KanbanTaskDetail>(taskKey(slug, id!))
+
+      if (previous) {
+        qc.setQueryData(taskKey(slug, id!), {
+          ...previous,
+          task: {
+            ...previous.task,
+            model_override: next.model.trim() || null,
+            provider_override: next.model.trim() ? next.provider.trim() || null : null,
+            reasoning_effort: next.effort.trim() || null
+          }
+        })
+      }
+
+      return { previous }
+    },
+    onError: (err, _next, context) => {
+      // Roll back only when this is the last in-flight pick — a newer
+      // optimistic write must not be clobbered by an older failure.
+      if (context?.previous && qc.isMutating({ mutationKey: OVERRIDE_MUT_KEY }) <= 1) {
+        qc.setQueryData(taskKey(slug, id!), context.previous)
+      }
+
+      host.notify({ kind: 'error', message: errText(err) })
+    },
+    onSettled: () => {
+      // Concurrent-pick guard: only the LAST in-flight PATCH refetches, so an
+      // early response can't clobber a later optimistic write.
+      if (qc.isMutating({ mutationKey: OVERRIDE_MUT_KEY }) <= 1) {
+        invalidate()
+      }
+    },
+    mutationKey: OVERRIDE_MUT_KEY
   })
 
   const mutate = (fn: () => Promise<unknown>, onDone?: () => void) => () =>
@@ -773,7 +822,7 @@ export function TaskDrawer({
               )}
               <MetaRow label={k.model}>
                 <ModelOverrideField
-                  onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
+                  onChange={next => overrideMut.mutate(next)}
                   value={{
                     effort: task.reasoning_effort ?? '',
                     model: task.model_override ?? '',
