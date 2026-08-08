@@ -16,6 +16,7 @@ import socket as _socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import weakref
@@ -45,6 +46,17 @@ _AUDIO_EXTS = frozenset(_AUDIO_MIME_TYPES)
 _TELEGRAM_AUDIO_ATTACHMENT_EXTS = frozenset({'.mp3', '.m4a'})
 _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
+# Delivery-time history is best-effort dedup metadata, not canonical state.
+# Keep this comfortably below the Discord heartbeat watchdog window and fail
+# open rather than withholding a legitimate attachment.
+_HISTORY_MEDIA_LOOKUP_TIMEOUT_SECONDS = 5.0
+# Timed-out reads cannot be cancelled while SQLite/Python code is already
+# running. Isolate and cap them so wedged best-effort dedup work cannot consume
+# the shared asyncio executor or create an unbounded number of worker threads.
+_HISTORY_MEDIA_LOOKUP_MAX_WORKERS = 2
+_HISTORY_MEDIA_LOOKUP_ADMISSION = threading.BoundedSemaphore(
+    _HISTORY_MEDIA_LOOKUP_MAX_WORKERS
+)
 
 
 def _platform_name(platform) -> str:
@@ -3476,6 +3488,96 @@ class BasePlatformAdapter(ABC):
         from gateway.run import _collect_history_media_paths
         return _collect_history_media_paths(history)
 
+    async def _bounded_history_media_paths_for_session(
+        self, session_key: str
+    ) -> Optional[set]:
+        """Run best-effort history lookup in a bounded isolated daemon thread."""
+        admission = _HISTORY_MEDIA_LOOKUP_ADMISSION
+        if not admission.acquire(blocking=False):
+            logger.warning(
+                "[%s] Media-delivery history lookup capacity exhausted for %s; "
+                "delivering bare local file path(s) without history dedup",
+                self.name,
+                session_key,
+            )
+            return None
+
+        loop = asyncio.get_running_loop()
+        result_future = loop.create_future()
+
+        def _publish_result(result=None, error=None):
+            if result_future.done():
+                return
+            if error is not None:
+                result_future.set_exception(error)
+            else:
+                result_future.set_result(result)
+
+        def _worker():
+            try:
+                result = self._history_media_paths_for_session(session_key)
+            except BaseException as exc:
+                try:
+                    loop.call_soon_threadsafe(_publish_result, None, exc)
+                except RuntimeError:
+                    pass  # Event loop already closed during gateway shutdown.
+            else:
+                try:
+                    loop.call_soon_threadsafe(_publish_result, result, None)
+                except RuntimeError:
+                    pass  # Event loop already closed during gateway shutdown.
+            finally:
+                admission.release()
+
+        try:
+            threading.Thread(
+                target=_worker,
+                name="media-history-lookup",
+                daemon=True,
+            ).start()
+        except Exception:
+            # Thread could not be started (e.g. thread exhaustion — start()
+            # raises RuntimeError). The worker never ran, so its
+            # finally-release never fires — release the admission permit here
+            # to avoid leaking it permanently, and fail open like every other
+            # path in this helper. (Unlike _worker's BaseException forwarding,
+            # swallowing here must not eat KeyboardInterrupt/SystemExit.)
+            admission.release()
+            logger.warning(
+                "[%s] Could not start media-delivery history lookup worker "
+                "for %s; delivering bare local file path(s) without history "
+                "dedup",
+                self.name,
+                session_key,
+                exc_info=True,
+            )
+            return None
+        try:
+            return await asyncio.wait_for(
+                result_future,
+                timeout=_HISTORY_MEDIA_LOOKUP_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "[%s] Timed out loading media-delivery history for %s; "
+                "delivering bare local file path(s) without history dedup",
+                self.name,
+                session_key,
+            )
+            return None
+        except Exception:
+            # The worker publishes its own failure via set_exception; this
+            # helper is documented as best-effort/fail-open, so swallow the
+            # error here instead of letting it kill media delivery.
+            logger.warning(
+                "[%s] Media-delivery history lookup failed for %s; "
+                "delivering bare local file path(s) without history dedup",
+                self.name,
+                session_key,
+                exc_info=True,
+            )
+            return None
+
     @abstractmethod
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """
@@ -4100,19 +4202,22 @@ class BasePlatformAdapter(ABC):
     def prepare_tts_text(self, text: str) -> str:
         """Prepare a spoken script for TTS.
 
-        Auto-TTS should not feed raw chat Markdown, ``<think>`` reasoning
+        Auto-TTS should not feed raw chat Markdown, ``⋗`` reasoning
         blocks, or compact symbols to the speech provider.  It should receive
         a transcript-like script: reasoning blocks removed, headings and
         bullets flattened into sentence pauses, and units like ``°C``
         expanded to words such as ``degrees Celsius``.
+
+        Provider-safe chunking and platform delivery limits are enforced
+        by the TTS tool.
         """
         try:
             from tools.tts_text_normalize import prepare_spoken_text
-            return prepare_spoken_text(text, max_chars=4000)
+            return prepare_spoken_text(text, max_chars=None)
         except Exception:
             # Keep auto-TTS best-effort if the normalizer ever fails.
             text = re.sub(r'<think[\s>].*?</think>', ' ', text, flags=re.DOTALL)
-            return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
+            return re.sub(r'[*_`#\[\]()]', '', text).strip()
 
     async def play_tts(
         self,
@@ -5892,16 +5997,6 @@ class BasePlatformAdapter(ABC):
                 media_files, response = self.extract_media(response)
                 media_files = self.filter_media_delivery_paths(media_files)
 
-                # Do NOT deduplicate MEDIA tags against prior turns here.
-                # The auto-append path in GatewayRunner._run_agent_inner already
-                # deduplicates auto-appended tags via _collect_auto_append_media_tags
-                # with history_media_paths, so this filter would only catch explicit
-                # MEDIA tags the model deliberately included in its response — which
-                # must be preserved (user asked to resend an image, the model echoed
-                # a path intentionally, etc.).  Bare-file-path dedup still applies
-                # to local_files below via the same _history_media_paths set.
-                _history_media_paths = self._history_media_paths_for_session(session_key)
-
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
                 # Strip any remaining internal directives from message body (fixes #1561).
@@ -5920,6 +6015,20 @@ class BasePlatformAdapter(ABC):
                     # instead of becoming native uploads.
                     local_files, text_content = self.extract_local_files(text_content)
                     local_files = self.filter_local_delivery_paths(local_files)
+                    # Do NOT load the full SQLite transcript for ordinary text or
+                    # explicit MEDIA tags.  History is needed only for bare local
+                    # paths auto-detected above.  Run that synchronous DB/decode
+                    # work off the platform event loop so a slow state.db read
+                    # cannot block Discord heartbeats and trigger the liveness
+                    # watchdog.  On lookup failure the helper returns None and we
+                    # fail open by delivering the candidate file.
+                    _history_media_paths = None
+                    if local_files:
+                        _history_media_paths = (
+                            await self._bounded_history_media_paths_for_session(
+                                session_key
+                            )
+                        )
                     if _history_media_paths:
                         _suppressed = [p for p in local_files if p in _history_media_paths]
                         if _suppressed:
@@ -5965,6 +6074,7 @@ class BasePlatformAdapter(ABC):
                 # Skip when streaming TTS already delivered audio for this turn
                 # (#60671) — the gateway streaming-TTS consumer sets the flag.
                 _tts_path = None
+                _tts_paths: List[str] = []
                 _tts_requested_path = None
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
@@ -5998,14 +6108,21 @@ class BasePlatformAdapter(ABC):
                             )
                             tts_data = _json.loads(tts_result_str)
                             if tts_data.get("success", True):
-                                _tts_path = tts_data.get("file_path") or _tts_requested_path
+                                raw_tts_paths = tts_data.get("file_paths") or [
+                                    tts_data.get("file_path")
+                                ]
+                                _tts_paths = [
+                                    str(path) for path in raw_tts_paths
+                                    if path and Path(path).exists()
+                                ]
+                                _tts_path = _tts_paths[0] if _tts_paths else None
                     except Exception as tts_err:
                         logger.warning("[%s] Auto-TTS failed: %s", self.name, tts_err)
 
                 # Play TTS audio before text (voice-first experience)
                 _tts_caption_delivered = False
-                _tts_cleanup_paths = {_tts_requested_path, _tts_path} - {None}
-                if _tts_path and Path(_tts_path).exists():
+                _tts_cleanup_paths = {_tts_requested_path, *_tts_paths} - {None}
+                for _tts_index, _tts_path in enumerate(_tts_paths):
                     try:
                         # Caption eligibility and payload stay on the ORIGINAL
                         # reply text. The spoken script is for synthesis only:
@@ -6013,9 +6130,11 @@ class BasePlatformAdapter(ABC):
                         # 1024-char caption limit, and captioning that spoken
                         # form would suppress the full formatted reply the
                         # user is meant to receive as a separate message.
+                        # Caption only on the first file.
                         telegram_tts_caption = None
                         if (
-                            self.platform == Platform.TELEGRAM
+                            _tts_index == 0
+                            and self.platform == Platform.TELEGRAM
                             and text_content
                             and text_content[:1024] == text_content
                         ):
@@ -6026,16 +6145,20 @@ class BasePlatformAdapter(ABC):
                             caption=telegram_tts_caption,
                             metadata=_final_thread_metadata,
                         )
+                        _record_delivery(tts_result)
                         _tts_caption_delivered = bool(
-                            telegram_tts_caption and getattr(tts_result, "success", False)
+                            _tts_caption_delivered
+                            or (
+                                telegram_tts_caption
+                                and getattr(tts_result, "success", False)
+                            )
                         )
                     finally:
-                        for _cleanup_path in _tts_cleanup_paths:
-                            try:
-                                os.remove(_cleanup_path)
-                            except OSError:
-                                pass
-                elif _tts_cleanup_paths:
+                        try:
+                            os.remove(_tts_path)
+                        except OSError:
+                            pass
+                if not _tts_paths and _tts_cleanup_paths:
                     for _cleanup_path in _tts_cleanup_paths:
                         try:
                             os.remove(_cleanup_path)
