@@ -107,9 +107,12 @@ async function main() {
 
   console.log(`copied ${keys.length} settings from file:// to ${devUrl.origin} (${total} keys there now)`)
 
-  for (const key of ['hermes-desktop-skin-v1', 'hermes-desktop-mode-v1']) {
-    if (installed[key]) {
-      console.log(`  ${key}: ${installed[key]}`)
+  // Print keys that might be related to auth/provider setup
+  for (const key of keys.sort()) {
+    if (/skin|mode|onboarded|oauth|provider|credential|kimi|claude/.test(key)) {
+      const val = installed[key]
+      const truncated = val.length > 60 ? val.slice(0, 57) + '...' : val
+      console.log(`  ${key}: ${truncated}`)
     }
   }
 
