@@ -162,6 +162,21 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
+def _is_delegated_child_context() -> bool:
+    """True when running under a ``delegate_task`` child context.
+
+    Prefers the ContextVar-aware predicate (covers in-process children);
+    falls back to the env marker when the agent package is unavailable
+    (bare CLI imports, subprocesses spawned by a child).
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return bool(is_delegated_child_process_context())
+    except Exception:
+        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+
+
 def _assert_not_delegated_child_mutation() -> None:
     """Reject Kanban state mutations from ``delegate_task`` child contexts.
 
@@ -173,13 +188,7 @@ def _assert_not_delegated_child_mutation() -> None:
     dispatcher claims, repair events, subscriptions, GC, etc.) and every board
     metadata mutator fails closed before touching durable state.
     """
-    try:
-        from agent.delegation_context import is_delegated_child_process_context
-
-        delegated = is_delegated_child_process_context()
-    except Exception:
-        delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
-    if delegated:
+    if _is_delegated_child_context():
         raise PermissionError(
             "delegate_task child contexts cannot mutate Kanban tasks or boards"
         )
@@ -2173,6 +2182,22 @@ def connect(
         path = db_path
     else:
         path = kanban_db_path(board=board)
+
+    # Delegated children may READ an existing board but must never create or
+    # migrate one. Without this branch, connect() from a child context (or a
+    # process that merely inherited HERMES_DELEGATED_CHILD_CONTEXT, e.g. a
+    # desktop backend spawned from a marked shell) dies in the first-open
+    # schema pass: _migrate_add_optional_columns → write_txn →
+    # _assert_not_delegated_child_mutation → PermissionError — turning every
+    # dashboard GET /board into a 500 even though the request only SELECTs.
+    # A missing DB still fails closed (creating it IS a board mutation), and
+    # children never populate _INITIALIZED_PATHS so a later non-child connect
+    # in the same process still runs the real schema/migration pass.
+    delegated_reader = _is_delegated_child_context()
+    if delegated_reader and not path.exists():
+        raise PermissionError(
+            "delegate_task child contexts cannot mutate Kanban tasks or boards"
+        )
     path.parent.mkdir(parents=True, exist_ok=True)
 
     # Fast path: once THIS process has initialized this path, the expensive
@@ -2243,7 +2268,16 @@ def connect(
                 # wrong-data returns.
                 conn.execute("PRAGMA cell_size_check=ON")
                 needs_init = resolved not in _INITIALIZED_PATHS
-                if needs_init:
+                if needs_init and delegated_reader:
+                    # Read-only open: the board already exists on disk, so the
+                    # schema is whatever its owner last migrated it to. Running
+                    # SCHEMA_SQL + the additive migration pass would mutate the
+                    # board (write_txn correctly refuses). Deliberately do NOT
+                    # cache into _INITIALIZED_PATHS: a later legitimate
+                    # (non-child) connect in this process must still run the
+                    # real init pass.
+                    pass
+                elif needs_init:
                     # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
                     # migrations. Cached so subsequent connect() calls in the same
                     # process are cheap. The lock prevents same-process dispatcher
@@ -2308,6 +2342,12 @@ def init_db(
     external tools that upgrade an old DB file — can call this to
     force re-migration.
     """
+    # Fail closed here rather than silently skipping the migration pass in
+    # connect(): init_db's contract is "schema is current when I return",
+    # which a delegated child cannot deliver. Callers that only need reads
+    # (dashboard _conn) already tolerate this raising and fall through to
+    # a read-only connect().
+    _assert_not_delegated_child_mutation()
     if db_path is not None:
         path = db_path
     else:

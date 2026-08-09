@@ -170,6 +170,68 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     assert "HERMES_KANBAN_CLAIM_LOCK" not in env
 
 
+def test_delegated_child_can_read_existing_board(monkeypatch, tmp_path):
+    """Regression: a leaked delegated-child marker must not break board READS.
+
+    Production shape (desktop dashboard, 2026-08-08): the backend process
+    inherited ``HERMES_DELEGATED_CHILD_CONTEXT=1``, so its first
+    ``connect()`` on the already-initialized board ran the schema/migration
+    pass (fresh-process ``_INITIALIZED_PATHS``), whose ``write_txn`` guard
+    raised PermissionError — and every ``GET /board`` 500'd even though the
+    request only needed SELECTs. A delegated child may read an existing
+    board; it must merely be unable to create or migrate one.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for key in ("HERMES_DELEGATED_CHILD_CONTEXT", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(key, raising=False)
+
+    from hermes_cli import kanban_db as kb
+
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="visible to children")
+    finally:
+        conn.close()
+
+    # Simulate the dashboard backend: a FRESH process (no cached init for
+    # this path) that inherited the delegated-child env marker.
+    kb._INITIALIZED_PATHS.clear()
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.title == "visible to children"
+    finally:
+        conn.close()
+
+
+def test_delegated_child_connect_fresh_db_fails_closed_without_artifacts(
+    monkeypatch,
+    tmp_path,
+):
+    """A delegated child must not create a board that does not exist yet —
+    and a refused connect must not leave a half-initialized DB file behind."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HERMES_DELEGATED_CHILD_CONTEXT", "1")
+
+    from hermes_cli import kanban_db as kb
+
+    kb._INITIALIZED_PATHS.clear()
+    with pytest.raises(PermissionError):
+        kb.connect()
+    assert not (home / "kanban.db").exists()
+
+
 def test_delegate_child_kanban_cli_cannot_delete_parent_board(
     monkeypatch,
     tmp_path,
