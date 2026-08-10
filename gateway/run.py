@@ -2525,6 +2525,9 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     # and run_sync) must not leak into a future conversation's first user
     # message — session keys are source-derived and REUSED.
     "_pending_turn_sidecar_notes",
+    # Per-session topic labels set by /topic-set; cleared on /new so a fresh
+    # conversation starts topic-free.
+    "_pending_project_topics",
 )
 
 # Sentinel for "caller did not pass metadata" vs "caller passed None".
@@ -6497,6 +6500,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _auto_tts_default = False
         if hasattr(adapter, "_auto_tts_default"):
             adapter._auto_tts_default = _auto_tts_default
+        if hasattr(adapter, "_tts_max_calls_per_turn"):
+            try:
+                from hermes_cli.config import load_config as _load_full_config
+                adapter._tts_max_calls_per_turn = int(
+                    (_load_full_config().get("tts") or {}).get("max_calls_per_turn", 1)
+                )
+            except Exception:
+                pass
 
         prefix = f"{platform.value}:"
         if isinstance(disabled_chats, set):
@@ -15636,8 +15647,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "title":
             return await self._handle_title_command(event)
 
+        if canonical == "var":
+            return await self._handle_var_command(event)
+
         if canonical == "resume":
             return await self._handle_resume_command(event)
+
+        if canonical == "project":
+            return await self._handle_project_command(event)
+
+        if canonical == "topic-set":
+            return await self._handle_topic_set_command(event)
 
         if canonical == "sessions":
             return await self._handle_sessions_command(event)
@@ -18572,7 +18592,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 not _streaming_tts_done
                 and self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent)
             ):
-                await self._send_voice_reply(event, response)
+                await self._send_voice_reply(event, response, session_key=session_key, turn_marker=run_generation)
 
             # If streaming already delivered the response, extract and
             # deliver any MEDIA: files before returning None.  Streaming
@@ -19704,10 +19724,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Return whether inbound voice/STT transcripts should be echoed to chat."""
         return bool(getattr(self.config, "stt_echo_transcripts", True))
 
-    async def _send_voice_reply(self, event: MessageEvent, text: str) -> None:
-        """Generate TTS audio and send as a voice message before the text reply."""
+    async def _send_voice_reply(
+        self,
+        event: MessageEvent,
+        text: str,
+        *,
+        session_key: str | None = None,
+        turn_marker: Any = None,
+    ) -> None:
+        """Generate TTS audio and send as a voice message before the text reply.
+        
+        DISABLED 2026-08-10 (Owen): Hermes uses Syndicate's Kokoro exclusively.
+        The base adapter's auto-TTS path (line 6120+) handles all synthesis,
+        so this path is skipped to avoid duplication.
+        """
+        return
+        
         audio_path = None
         actual_paths: List[str] = []
+
+        # Budget guard: if the base adapter already synthesized TTS for this
+        # turn (auto-TTS on voice input), skip the duplicate.  The guard lives
+        # on the adapter and shares a per-turn counter.
+        _budget_adapter = self._adapter_for_source(event.source)
+        if _budget_adapter is not None:
+            _budget_fn = getattr(_budget_adapter, "_tts_call_budget_available", None)
+            if callable(_budget_fn) and not _budget_fn(session_key, turn_marker, event=event):
+                logger.debug("Skipping duplicate voice reply: TTS budget exhausted for %s", event.source.chat_id)
+                return
+
         try:
             from tools.tts_tool import text_to_speech_tool, _strip_markdown_for_tts
 
@@ -19725,6 +19770,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             result_json = await asyncio.to_thread(
                 text_to_speech_tool, text=tts_text, output_path=audio_path
             )
+
+            # Charge this synthesis against the per-turn budget so the
+            # base adapter auto-TTS path and this runner path can't
+            # both fire.
+            if _budget_adapter is not None:
+                _charge_fn = getattr(_budget_adapter, "_tts_charge_call", None)
+                if callable(_charge_fn):
+                    _charge_fn(session_key, turn_marker, event=event)
+
             try:
                 result = json.loads(result_json)
             except (json.JSONDecodeError, TypeError):

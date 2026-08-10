@@ -2857,6 +2857,15 @@ class BasePlatformAdapter(ABC):
         # turn key here so the base adapter's whole-file auto-TTS path skips
         # the duplicate.  Cleared after the turn completes.
         self._streaming_tts_completed_turns: set[str] = set()
+        # Per-turn TTS synthesis call counter.  Prevents the gateway runner
+        # (_send_voice_reply) and the base adapter auto-TTS path from both
+        # invoking text_to_speech_tool() for the same response, which
+        # produced exactly-duplicate audio + doubled "TTS audio saved" logs.
+        # Keyed by turn_key, value is the number of calls this turn.  The
+        # config knob ``tts.max_calls_per_turn`` (default 1) caps it; set
+        # to 0 to disable the guard entirely.
+        self._tts_calls_this_turn: dict[str, int] = {}
+        self._tts_max_calls_per_turn: int = 1  # populated from config at connect (default 1, set to 0 to disable)
         # Chats where typing indicator is paused (e.g. during approval waits).
         # _keep_typing skips send_typing when the chat_id is in this set.
         self._typing_paused: set = set()
@@ -4315,6 +4324,40 @@ class BasePlatformAdapter(ABC):
             turn_marker,
             event=event,
         )
+
+    def _tts_call_budget_available(
+        self,
+        session_key: str | None,
+        turn_marker: Any = None,
+        *,
+        event: Any = None,
+    ) -> bool:
+        """Return True if this turn has not yet exhausted its TTS call budget."""
+        max_calls = getattr(self, "_tts_max_calls_per_turn", 1)
+        if max_calls <= 0:
+            return True  # guard disabled
+        turn_key = streaming_tts_turn_key(session_key, turn_marker, event=event)
+        if not turn_key:
+            return True
+        used = getattr(self, "_tts_calls_this_turn", {}).get(turn_key, 0)
+        return used < max_calls
+
+    def _tts_charge_call(
+        self,
+        session_key: str | None,
+        turn_marker: Any = None,
+        *,
+        event: Any = None,
+    ) -> None:
+        """Record one TTS synthesis call against this turn's budget."""
+        max_calls = getattr(self, "_tts_max_calls_per_turn", 1)
+        if max_calls <= 0:
+            return
+        turn_key = streaming_tts_turn_key(session_key, turn_marker, event=event)
+        if not turn_key:
+            return
+        calls = getattr(self, "_tts_calls_this_turn", {})
+        calls[turn_key] = calls.get(turn_key, 0) + 1
 
     async def send_video(
         self,
@@ -6084,6 +6127,11 @@ class BasePlatformAdapter(ABC):
                             session_key,
                             getattr(interrupt_event, "_hermes_run_generation", None),
                             event=event,
+                        )
+                        and self._tts_call_budget_available(
+                            session_key,
+                            getattr(interrupt_event, "_hermes_run_generation", None),
+                            event=event,
                         )):
                     try:
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
@@ -6105,6 +6153,11 @@ class BasePlatformAdapter(ABC):
                                 text_to_speech_tool,
                                 text=speech_text,
                                 output_path=_tts_requested_path,
+                            )
+                            self._tts_charge_call(
+                                session_key,
+                                getattr(interrupt_event, "_hermes_run_generation", None),
+                                event=event,
                             )
                             tts_data = _json.loads(tts_result_str)
                             if tts_data.get("success", True):
