@@ -4340,7 +4340,11 @@ class BasePlatformAdapter(ABC):
         if not turn_key:
             return True
         used = getattr(self, "_tts_calls_this_turn", {}).get(turn_key, 0)
-        return used < max_calls
+        available = used < max_calls
+        logger.debug(
+            f"TTS budget check: turn_key={turn_key}, used={used}, max={max_calls}, available={available}"
+        )
+        return available
 
     def _tts_charge_call(
         self,
