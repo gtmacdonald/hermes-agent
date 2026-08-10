@@ -319,6 +319,19 @@ const DESKTOP_COMMAND_SPECS: readonly DesktopCommandSpec[] = [
   { name: '/undo', description: 'Remove the last user/assistant exchange', surface: exec() },
   { name: '/usage', description: 'Show token usage for this session', surface: exec() },
   { name: '/version', description: 'Show Hermes Agent version', surface: exec() },
+  {
+    name: '/project',
+    description: 'Switch project/cwd mid-session, optionally with a topic label',
+    aliases: ['/cd'],
+    surface: exec(),
+    argumentMode: 'text'
+  },
+  {
+    name: '/topic-set',
+    description: 'Set or clear a topic label for the current project',
+    surface: exec(),
+    argumentMode: 'text'
+  },
 
   // No desktop surface, but carry an alias (underscore spelling variants).
   { name: '/reload-mcp', aliases: ['/reload_mcp'], surface: unavailable('advanced') },

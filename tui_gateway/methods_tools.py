@@ -1071,6 +1071,119 @@ def _(rid, params: dict) -> dict:
             )
             return _err(rid, 5009, f"compress failed: {exc}")
 
+    if name == "project":
+        from agent.project import (
+            PENDING_NOTE_ATTR,
+            PENDING_TOPIC_ATTR,
+            apply_project_change_session,
+            get_project_topic,
+        )
+
+        if not session:
+            return _err(rid, 4001, "no active session")
+        sid = params.get("session_id", "")
+
+        if not arg.strip():
+            cwd = str(session.get("cwd") or "")
+            topic = get_project_topic(session)
+            lines = []
+            if cwd:
+                lines.append(f"📁 Project: {cwd}")
+            if topic:
+                lines.append(f"🏷️  Topic: {topic}")
+            if not lines:
+                lines.append("No project set. Usage: /project <path> [topic: <label>]")
+            else:
+                lines.append("Usage: /project <path> [topic: <label>]")
+            return _ok(rid, {"type": "exec", "output": "\n".join(lines)})
+
+        # Parse: <path> [topic: <label>]
+        topic = None
+        path_arg = arg.strip()
+        lower = path_arg.lower()
+        topic_marker = " topic: "
+        idx = lower.rfind(topic_marker)
+        if idx < 0:
+            topic_marker = " topic:"
+            idx = lower.rfind(topic_marker)
+        if idx >= 0:
+            prefix_end = idx
+            if prefix_end > 0 and not path_arg[prefix_end - 1].isspace():
+                pass  # Not a real "topic:" — treat the whole thing as a path
+            else:
+                path_arg = path_arg[:idx].strip()
+                topic = path_arg[idx + len(topic_marker):].strip()
+                if not topic:
+                    return _err(rid, 4004, "topic label is empty after 'topic:'")
+
+        if not path_arg:
+            return _err(rid, 4004, "path required. Usage: /project <path> [topic: <label>]")
+
+        if session.get("running"):
+            return _err(rid, 4009, "session busy — /interrupt the current turn before /project")
+
+        try:
+            note = apply_project_change_session(session, path_arg, topic=topic)
+        except ValueError as exc:
+            return _err(rid, 4017, str(exc))
+
+        # Queue the note for the next user turn
+        session[PENDING_NOTE_ATTR] = note
+
+        # Emit session.info so the desktop follows the cwd change
+        try:
+            agent = session.get("agent")
+            info = (
+                _session_info(agent, session)
+                if agent is not None
+                else {
+                    "cwd": session.get("cwd", ""),
+                    "branch": _git_branch_for_cwd(session.get("cwd", "")),
+                    "project": _project_info_for_cwd(session.get("cwd", "")),
+                    "lazy": True,
+                }
+            )
+            _emit("session.info", sid, info)
+        except Exception:
+            pass
+
+        output = f"✓ Project switched: {session.get('cwd', path_arg)}"
+        if topic:
+            output += f"\n   Topic: {topic}"
+        return _ok(rid, {"type": "exec", "output": output})
+
+    if name == "topic-set":
+        from agent.project import (
+            PENDING_NOTE_ATTR,
+            PENDING_TOPIC_ATTR,
+            build_project_note,
+            get_project_topic,
+        )
+
+        if not session:
+            return _err(rid, 4001, "no active session")
+        arg = (arg or "").strip()
+        old_topic = get_project_topic(session) or None
+        cwd = str(session.get("cwd") or "")
+
+        if not arg:
+            if old_topic:
+                return _ok(rid, {"type": "exec", "output": f"🏷️  Topic: {old_topic}"})
+            return _ok(rid, {"type": "exec", "output": "No topic set. Usage: /topic-set <label> | clear"})
+
+        if arg.lower() == "clear":
+            if not old_topic:
+                return _ok(rid, {"type": "exec", "output": "No topic to clear."})
+            session[PENDING_TOPIC_ATTR] = None
+            note = build_project_note(old_cwd=cwd, new_cwd=cwd, old_topic=old_topic, new_topic=None)
+            session[PENDING_NOTE_ATTR] = note
+            return _ok(rid, {"type": "exec", "output": "✓ Topic cleared."})
+
+        session[PENDING_TOPIC_ATTR] = arg
+        note = build_project_note(old_cwd=cwd, new_cwd=cwd, old_topic=old_topic, new_topic=arg)
+        session[PENDING_NOTE_ATTR] = note
+        return _ok(rid, {"type": "exec", "output": f"✓ Topic set: {arg}"})
+
     return _err(rid, 4018, f"not a quick/plugin/bundle/skill command: {name}")
 
 

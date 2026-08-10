@@ -1376,6 +1376,60 @@ class CLICommandsMixin:
             print("  Usage: /personality <name>")
             print()
 
+    def _handle_var_command(self, cmd: str):
+        """Handle the /var command to manage per-session variables.
+
+        ``/var``                  → list all variables for this session
+        ``/var list``             → same
+        ``/var set <key> <val>``  → set a variable
+        ``/var del <key>``        → delete a variable
+        ``/var clear``            → remove all variables
+        """
+        try:
+            import sys
+            _mod = None
+            for _mn in ("hermes_plugins.session_variables", "plugins.session_variables"):
+                if _mn in sys.modules:
+                    _mod = sys.modules[_mn]
+                    break
+            if _mod is None:
+                raise ImportError("session-variables plugin not loaded")
+            set_var = _mod.set_var
+            del_var = _mod.del_var
+            clear_vars = _mod.clear_vars
+            list_vars = _mod.list_vars
+        except (ImportError, AttributeError):
+            print("(._.) session-variables plugin is not available.")
+            return
+
+        parts = cmd.split(maxsplit=2)  # /var <sub> <rest>
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        sid = self.session_id
+
+        if not sub or sub == "list":
+            print(list_vars(sid))
+        elif sub == "set":
+            if len(parts) < 3:
+                print("  Usage: /var set <key> <value>")
+                return
+            # parts[2] is "key value..." — split key from the rest
+            kv = parts[2].split(maxsplit=1)
+            if len(kv) < 2:
+                print("  Usage: /var set <key> <value>")
+                return
+            key, val = kv[0], kv[1]
+            print(f"  {set_var(sid, key, val)}")
+        elif sub == "del":
+            if len(parts) < 3 or not parts[2].strip():
+                print("  Usage: /var del <key>")
+                return
+            key = parts[2].strip().split()[0]
+            print(f"  {del_var(sid, key)}")
+        elif sub == "clear":
+            print(f"  {clear_vars(sid)}")
+        else:
+            print("  Usage: /var [list|set <key> <value>|del <key>|clear]")
+
     def _handle_pet_command(self, cmd: str):
         """Toggle, browse, or adopt a petdex mascot.
 
@@ -2075,8 +2129,12 @@ class CLICommandsMixin:
 
                 # Play bell if enabled
                 if self.bell_on_complete:
-                    sys.stdout.write("\a")
-                    sys.stdout.flush()
+                    try:
+                        from hermes_cli.bell import play_bell
+                        play_bell()
+                    except Exception:
+                        # Fail silently — bell is a courtesy
+                        pass
 
             except Exception as e:
                 # Same TUI refresh pattern as success path (#2718)

@@ -9780,6 +9780,19 @@ def _run_prompt_submit(
                 elif isinstance(run_message, list):
                     run_message = [{"type": "text", "text": reaction_notes}, *run_message]
 
+            # Project/topic change note from /project or /topic-set — same
+            # API-local enrichment channel as the reaction note above. Tells
+            # the model the cwd/project and/or topic label changed without
+            # rewriting the system prompt (which would break the prefix
+            # cache). One-shot: cleared on read.
+            from agent.project import PENDING_NOTE_ATTR as _PROJECT_NOTE_ATTR
+            _project_note = session.pop(_PROJECT_NOTE_ATTR, "") if isinstance(session, dict) else ""
+            if _project_note:
+                if isinstance(run_message, str):
+                    run_message = f"{_project_note}\n\n{run_message}"
+                elif isinstance(run_message, list):
+                    run_message = [{"type": "text", "text": _project_note}, *run_message]
+
             def _stream(delta):
                 with session["history_lock"]:
                     _append_inflight_delta(session, delta)

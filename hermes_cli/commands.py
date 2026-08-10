@@ -188,6 +188,12 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, aliases=("set-home",)),
     CommandDef("resume", "Resume a previously-named session", "Session",
                args_hint="[name]"),
+    CommandDef("project", "Switch project/cwd mid-session, optionally with a topic label", "Session",
+               aliases=("cd",), args_hint="[path] [topic: <label>]",
+               busy_policy="dispatch"),
+    CommandDef("topic-set", "Set or clear a topic label for the current project", "Session",
+               args_hint="[label | clear]",
+               busy_policy="dispatch"),
 
     # Configuration
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),
@@ -205,6 +211,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
 
     CommandDef("personality", "Set a predefined personality", "Configuration",
                args_hint="[name]"),
+    CommandDef("var", "Manage per-session variables injected into context", "Configuration",
+               args_hint="[list|set <key> <val>|del <key>|clear]",
+               subcommands=("list", "set", "del", "clear"),
+               aliases=("vars",),
+               busy_policy="dispatch"),
     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
                cli_only=True, aliases=("sb",)),
     CommandDef("battery", "Toggle a color-coded battery indicator in the status bar",

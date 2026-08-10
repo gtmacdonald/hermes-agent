@@ -4503,6 +4503,180 @@ class GatewaySlashCommandsMixin:
             else:
                 return t("gateway.title.current_no_title", session_id=session_id)
 
+    async def _handle_var_command(self, event: MessageEvent) -> str:
+        """Handle /var — manage per-session variables injected into context."""
+        try:
+            import sys
+            _mod = None
+            for _mn in ("hermes_plugins.session_variables", "plugins.session_variables"):
+                if _mn in sys.modules:
+                    _mod = sys.modules[_mn]
+                    break
+            if _mod is None:
+                raise ImportError("session-variables plugin not loaded")
+            set_var = _mod.set_var
+            del_var = _mod.del_var
+            clear_vars = _mod.clear_vars
+            list_vars = _mod.list_vars
+        except (ImportError, AttributeError):
+            return "session-variables plugin is not available."
+
+        source = event.source
+        session_entry = await self.async_session_store.get_or_create_session(source)
+        session_id = session_entry.session_id
+        args = event.get_command_args().strip()
+
+        if not args or args.lower() == "list":
+            return list_vars(session_id)
+
+        parts = args.split(maxsplit=1)
+        sub = parts[0].lower()
+
+        if sub == "set":
+            if len(parts) < 2:
+                return "Usage: /var set <key> <value>"
+            kv = parts[1].split(maxsplit=1)
+            if len(kv) < 2:
+                return "Usage: /var set <key> <value>"
+            return set_var(session_id, kv[0], kv[1])
+
+        if sub == "del":
+            if len(parts) < 2 or not parts[1].strip():
+                return "Usage: /var del <key>"
+            key = parts[1].strip().split()[0]
+            return del_var(session_id, key)
+
+        if sub == "clear":
+            return clear_vars(session_id)
+
+        return "Usage: /var [list|set <key> <value>|del <key>|clear]"
+
+    async def _handle_project_command(self, event: MessageEvent) -> str:
+        """Handle /project — switch cwd mid-session + optional topic label.
+
+        For gateway sessions, the cwd change uses ``set_session_cwd`` (the
+        contextvar) and ``TERMINAL_CWD`` so all tools land in the new
+        directory. The note telling the model what changed is queued on
+        ``_pending_model_notes`` (same dict the /model switch uses) keyed by
+        the session key, and prepended to the next user message at turn time.
+        """
+        from agent.project import apply_project_change
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        args = event.get_command_args().strip()
+
+        # Current state when no args
+        if not args:
+            try:
+                cwd = os.getenv("TERMINAL_CWD", "") or os.getcwd()
+            except OSError:
+                cwd = "?"
+            # Topic is per-session on the runner
+            topics = getattr(self, "_pending_project_topics", {})
+            topic = topics.get(session_key, "")
+            lines = [f"📁 Project: {cwd}"]
+            if topic:
+                lines.append(f"🏷️  Topic: {topic}")
+            lines.append("Usage: /project <path> [topic: <label>]")
+            return "\n".join(lines)
+
+        # Parse: <path> [topic: <label>]
+        topic = None
+        path_arg = args
+        lower = args.lower()
+        topic_marker = " topic: "
+        idx = lower.rfind(topic_marker)
+        if idx < 0:
+            topic_marker = " topic:"
+            idx = lower.rfind(topic_marker)
+        if idx >= 0:
+            prefix_end = idx
+            if prefix_end > 0 and not args[prefix_end - 1].isspace():
+                pass
+            else:
+                path_arg = args[:idx].strip()
+                topic = args[idx + len(topic_marker):].strip()
+                if not topic:
+                    return "⚠ Topic label is empty after 'topic:'."
+
+        if not path_arg:
+            return "⚠ Path required. Usage: /project <path> [topic: <label>]"
+
+        topics = getattr(self, "_pending_project_topics", {})
+        old_topic = topics.get(session_key) or None
+
+        try:
+            note = apply_project_change(
+                path_arg,
+                topic=topic,
+                old_topic=old_topic,
+                session_key=session_key,
+            )
+        except ValueError as exc:
+            return f"⚠ {exc}"
+
+        # Store topic label
+        if not hasattr(self, "_pending_project_topics"):
+            self._pending_project_topics = {}
+        if topic is not None:
+            self._pending_project_topics[session_key] = topic
+        elif old_topic:
+            self._pending_project_topics.pop(session_key, None)
+
+        # Queue the note for the next user turn (same dict /model uses)
+        if not hasattr(self, "_pending_model_notes"):
+            self._pending_model_notes = {}
+        self._pending_model_notes[session_key] = note
+
+        try:
+            new_cwd = os.getcwd()
+        except OSError:
+            new_cwd = path_arg
+        result = f"✓ Project switched: {new_cwd}"
+        if topic:
+            result += f"\n   Topic: {topic}"
+        return result
+
+    async def _handle_topic_set_command(self, event: MessageEvent) -> str:
+        """Handle /topic-set — set or clear a topic label for the current project."""
+        from agent.project import build_project_note
+
+        source = event.source
+        session_key = self._session_key_for_source(source)
+        arg = event.get_command_args().strip()
+
+        if not hasattr(self, "_pending_project_topics"):
+            self._pending_project_topics = {}
+        old_topic = self._pending_project_topics.get(session_key) or None
+
+        if not arg:
+            if old_topic:
+                return f"🏷️  Topic: {old_topic}"
+            return "No topic set. Usage: /topic-set <label> | clear"
+
+        try:
+            cwd = os.getenv("TERMINAL_CWD", "") or os.getcwd()
+        except OSError:
+            cwd = ""
+
+        if arg.lower() == "clear":
+            if not old_topic:
+                return "No topic to clear."
+            self._pending_project_topics.pop(session_key, None)
+            note = build_project_note(old_cwd=cwd, new_cwd=cwd, old_topic=old_topic, new_topic=None)
+            if not hasattr(self, "_pending_model_notes"):
+                self._pending_model_notes = {}
+            self._pending_model_notes[session_key] = note
+            return "✓ Topic cleared."
+
+        self._pending_project_topics[session_key] = arg
+        note = build_project_note(old_cwd=cwd, new_cwd=cwd, old_topic=old_topic, new_topic=arg)
+        if not hasattr(self, "_pending_model_notes"):
+            self._pending_model_notes = {}
+        self._pending_model_notes[session_key] = note
+        return f"✓ Topic set: {arg}"
+
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — list or switch to a previous session."""
         if not self._session_db:

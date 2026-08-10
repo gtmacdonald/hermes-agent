@@ -1,0 +1,6 @@
+name: session-variables
+version: "0.1.0"
+description: "Inject user-configurable per-session variables into the model's context. Variables are stored as JSON at ~/.hermes/session_vars/<session_id>.json and are injected into the user message (not the system prompt) only when the file changes, preserving prompt caching. On first turn or after a change, the full variable set is attached; subsequent turns with no change are silent."
+author: "NousResearch"
+hooks:
+  - pre_llm_call
