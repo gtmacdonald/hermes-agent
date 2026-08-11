@@ -63,7 +63,7 @@ def build_write_denied_paths(home: str) -> set[str]:
 
 def build_write_denied_prefixes(home: str) -> list[str]:
     """Return sensitive directory prefixes that must never be written."""
-    return [
+    base = [
         os.path.realpath(p) + os.sep
         for p in [
             os.path.join(home, ".ssh"),
@@ -78,6 +78,296 @@ def build_write_denied_prefixes(home: str) -> list[str]:
             os.path.join(home, ".config", "gcloud"),
         ]
     ]
+    # t_4281c05c (continuing t_1c525fc2): when the active profile is
+    # 'default', the user's home (``~/``) and the default Hermes home
+    # (``~/.hermes`` / ``<root>``) are readonly by default.  Expose them
+    # as denied prefixes so callers that only consult this helper see the
+    # same posture.  The explicit kanban allowlist in
+    # ``_is_kanban_allowlisted`` / ``_classify_write_denial`` /
+    # ``classify_default_home_write`` takes precedence, so kanban DB paths
+    # under the denied tree remain writable.
+    try:
+        if _resolve_active_profile_name() == "default":
+            home_real = os.path.realpath(os.path.expanduser("~"))
+            try:
+                root_real = os.path.realpath(_hermes_root_path())
+            except Exception:
+                root_real = None
+            for pref in (home_real, root_real):
+                if not pref:
+                    continue
+                needle = pref + os.sep
+                if needle not in base:
+                    base.append(needle)
+    except Exception:
+        pass
+    return base
+
+
+# ---------------------------------------------------------------------------
+# Kanban allowlist — explicit carve-out for board DB paths
+#
+# When the default profile is active, ``~/`` and ``~/.hermes`` are denied
+# prefixes, but kanban database files (all boards, cross-profile) live
+# under that tree (``<root>/kanban.db`` and ``<root>/kanban/boards/*/kanban.db``,
+# plus their WAL/SHM/lock sidecars and the per-board workspaces/attachments/logs).
+# The allowlist takes precedence over the denied prefixes so multi-agent
+# workflows keep functioning even though the surrounding tree is readonly.
+# ---------------------------------------------------------------------------
+
+def _is_kanban_allowlisted(resolved: str) -> bool:
+    """Return True when *resolved* is a kanban database / board path that must stay writable.
+
+    Covers:
+      * ``<root>/kanban.db`` and any SQLite sidecar (``kanban.db-wal``, ``kanban.db-shm``,
+        ``kanban.db.lock``, ``.bak*``, etc.) — prefix match on the DB path.
+      * Anything under ``<root>/kanban/`` (boards, workspaces, attachments, logs).
+      * The explicit ``HERMES_KANBAN_DB`` env-pinned path and its sidecars.
+      * The ``HERMES_KANBAN_HOME``-anchored kanban tree when that env overrides the root.
+
+    Best-effort: any resolver failure returns False (fail closed — the surrounding
+    default/home deny still applies) so a broken kanban install never silently
+    widens the writable surface.
+    """
+    # Fast path: if the path doesn't look like it could be kanban-related, avoid imports.
+    # Still do the full check for correctness — the board DBs are under <root>, which
+    # is under ~, so we can't early-exit on "not under ~".
+    try:
+        # Primary kanban home (respects HERMES_KANBAN_HOME override).
+        from hermes_cli.kanban_db import kanban_home as _kb_home
+        try:
+            kh_real = os.path.realpath(str(_kb_home()))
+        except Exception:
+            kh_real = None
+        if kh_real:
+            # Legacy default board DB at <kh>/kanban.db (+ sidecars)
+            legacy_db = os.path.join(kh_real, "kanban.db")
+            if resolved == legacy_db or resolved.startswith(legacy_db):
+                return True
+            # New layout: everything under <kh>/kanban/
+            kanban_dir = kh_real + os.sep + "kanban" + os.sep
+            if resolved == kanban_dir.rstrip(os.sep) or resolved.startswith(kanban_dir):
+                return True
+            # Also cover <kh>/kanban.db.* sidecars that don't match the prefix rule
+            # above due to exact-equals vs startswith nuance — already handled, but
+            # keep explicit for clarity: kanban.db-wal etc. share the legacy_db prefix.
+        # Env-pinned DB (dispatcher injects HERMES_KANBAN_DB into workers).
+        env_db = os.environ.get("HERMES_KANBAN_DB", "").strip()
+        if env_db:
+            try:
+                env_real = os.path.realpath(os.path.expanduser(env_db))
+                if resolved == env_real or resolved.startswith(env_real):
+                    return True
+            except Exception:
+                pass
+        # Fallback: also check the Hermes root directly for the legacy path,
+        # in case kanban_home() resolution disagrees (e.g. profile mode).
+        try:
+            root_real = os.path.realpath(_hermes_root_path())
+            legacy2 = os.path.join(root_real, "kanban.db")
+            if resolved == legacy2 or resolved.startswith(legacy2):
+                return True
+            kanban_dir2 = root_real + os.sep + "kanban" + os.sep
+            if resolved == kanban_dir2.rstrip(os.sep) or resolved.startswith(kanban_dir2):
+                return True
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
+# default/home readonly-by-default
+#
+# The default profile's home is the Hermes root itself (``~/.hermes``), and
+# non-local terminal backends additionally mirror a home at
+# ``…/sandboxes/<backend>/<task>/home/``. Both used to be writable by the
+# generic file tools unless a narrower rule happened to catch the path, which
+# is how agents ended up rewriting the default profile's SOUL.md / config.yaml
+# / memories from an unrelated profile's session, and how divergent copies
+# accumulated inside sandbox mirrors.
+#
+# Posture is now flipped: reads are unaffected, writes anywhere under the
+# default home (or a sandbox-mirror home) are DENIED unless explicitly opted
+# in. Opt-in is either
+#
+#   * env  ``HERMES_ALLOW_WRITE_DEFAULT_HOME=1``  (per-task / per-process), or
+#   * config ``file_safety.allow_write_default_home: true``.
+#
+# Non-default profile homes (``<root>/profiles/<name>/…``) are NOT affected —
+# they keep their existing posture and the separate cross-profile soft guard.
+# Shared operational areas that merely live under the root but are not default
+# profile state (kanban boards/workspaces, the profiles/ tree itself) stay
+# writable so multi-agent workflows keep functioning.
+# ---------------------------------------------------------------------------
+
+ALLOW_WRITE_DEFAULT_HOME_ENV = "HERMES_ALLOW_WRITE_DEFAULT_HOME"
+
+# Top-level entries under the Hermes root that are shared infrastructure rather
+# than default-profile state. Writes here remain allowed.
+# ``cache/`` is the consolidated TTS/image/web/delegation cache
+# (cache/audio, cache/images, …) and must stay writable so
+# ``tools/tts_tool.DEFAULT_OUTPUT_DIR`` works even when the
+# default profile is readonly; likewise the legacy flat cache
+# dirs (audio_cache, image_cache, …) that still exist on disk.
+DEFAULT_HOME_WRITE_EXEMPT_TOP_LEVEL: tuple[str, ...] = (
+    "profiles",   # other profiles — governed by the cross-profile guard
+    "kanban",     # board DBs, per-task workspaces
+    "workspaces",
+    "projects",
+    "tmp",
+    "cache",       # TTS audio (cache/audio), images, web, delegation
+    "audio_cache", # legacy TTS cache dir
+    "image_cache",
+    "video_cache",
+    "web_cache",
+)
+
+
+def default_home_writes_allowed() -> bool:
+    """Return True when the default-home readonly default has been opted out of.
+
+    Checked in order: ``HERMES_ALLOW_WRITE_DEFAULT_HOME`` env var, then
+    ``file_safety.allow_write_default_home`` in the Hermes config. Any
+    failure to read config is treated as "not opted in" (fail closed).
+
+    This mirrors :func:`hermes_cli.config.allow_write_default_home`. The
+    canonical flag is defined in ``hermes_cli/config_defaults.py``
+    (``file_safety.allow_write_default_home: False``); that module and that
+    accessor own the definition, and this function is the enforcement-side
+    mirror delegated to by the write-denial path. Prefer
+    ``hermes_cli.config.allow_write_default_home`` when you already have a
+    loaded config dict to avoid a second disk read.
+    """
+    env = os.getenv(ALLOW_WRITE_DEFAULT_HOME_ENV)
+    if env is not None:
+        try:
+            from utils import is_truthy_value
+            if is_truthy_value(env):
+                return True
+        except Exception:
+            if str(env).strip().lower() in {"1", "true", "yes", "on"}:
+                return True
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        section = cfg.get("file_safety") or {}
+        if isinstance(section, dict):
+            from utils import is_truthy_value
+            return is_truthy_value(section.get("allow_write_default_home"), default=False)
+    except Exception:
+        return False
+    return False
+
+
+def _sandbox_mirror_home_root(resolved: str) -> Optional[str]:
+    """Return the ``…/sandboxes/<backend>/<task>/home`` root containing *resolved*.
+
+    Path-shape only, so it works regardless of which profile is active and
+    without requiring any Hermes resolver to succeed.
+    """
+    parts = Path(resolved).parts
+    for i, part in enumerate(parts):
+        if part != "sandboxes":
+            continue
+        # sandboxes / <backend> / <task> / home / …
+        if i + 3 >= len(parts):
+            continue
+        if parts[i + 3] == "home":
+            return str(Path(*parts[: i + 4]))
+    return None
+
+
+def classify_default_home_write(path: str) -> Optional[dict]:
+    """Classify a write target as landing in the readonly default-profile home.
+
+    Returns ``None`` when the path is outside the default home (including all
+    non-default profile homes and the shared areas listed in
+    ``DEFAULT_HOME_WRITE_EXEMPT_TOP_LEVEL``). Otherwise returns a dict with:
+
+      * ``target_path``: resolved path string
+      * ``home_root``: the default home (or sandbox-mirror home) it belongs to
+      * ``kind``: ``"default_home"`` or ``"sandbox_mirror_home"``
+
+    The ``~/`` (user home) leg is only classified when the active profile
+    is ``'default'`` — see t_4281c05c. The ``<root>`` (``~/.hermes``)
+    leg is always classified (default home is always readonly, regardless
+    of who writes it).  This split keeps ``.bashrc`` writable when a
+    non-default profile is active, while still protecting default state
+    (``SOUL.md``, ``config.yaml``, ``memories/``) unconditionally.
+    Kanban database paths (all boards, cross-profile) are explicitly
+    allowlisted and take precedence over both legs — see
+    ``_is_kanban_allowlisted``.  Reads remain unrestricted.
+    """
+    try:
+        resolved = os.path.realpath(os.path.expanduser(str(path)))
+    except (OSError, ValueError):
+        return None
+
+    # Kanban allowlist takes precedence over every denied prefix.
+    try:
+        if _is_kanban_allowlisted(resolved):
+            return None
+    except Exception:
+        pass
+
+    # Home (~/) deny — only when active profile is 'default' (t_4281c05c).
+    try:
+        is_default = _resolve_active_profile_name() == "default"
+    except Exception:
+        is_default = False
+    if is_default:
+        try:
+            home_real = os.path.realpath(os.path.expanduser("~"))
+            if resolved == home_real or resolved.startswith(home_real + os.sep):
+                try:
+                    root_real_tmp = os.path.realpath(_hermes_root_path())
+                    is_under_root = resolved == root_real_tmp or resolved.startswith(root_real_tmp + os.sep)
+                except Exception:
+                    is_under_root = False
+                if not is_under_root:
+                    return {
+                        "target_path": resolved,
+                        "home_root": home_real,
+                        "kind": "default_home",
+                    }
+        except Exception:
+            pass
+
+    mirror_home = _sandbox_mirror_home_root(resolved)
+    if mirror_home is not None and (
+        resolved == mirror_home or resolved.startswith(mirror_home + os.sep)
+    ):
+        return {
+            "target_path": resolved,
+            "home_root": mirror_home,
+            "kind": "sandbox_mirror_home",
+        }
+
+    try:
+        root_real = os.path.realpath(_hermes_root_path())
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+    if resolved == root_real:
+        return {
+            "target_path": resolved,
+            "home_root": root_real,
+            "kind": "default_home",
+        }
+    if not resolved.startswith(root_real + os.sep):
+        return None
+
+    rel_parts = Path(resolved[len(root_real) + 1:]).parts
+    if rel_parts and rel_parts[0] in DEFAULT_HOME_WRITE_EXEMPT_TOP_LEVEL:
+        return None
+
+    return {
+        "target_path": resolved,
+        "home_root": root_real,
+        "kind": "default_home",
+    }
 
 
 def get_safe_write_roots() -> set[str]:
@@ -99,15 +389,51 @@ def get_safe_write_roots() -> set[str]:
 
 
 def _classify_write_denial(path: str) -> Optional[str]:
-    """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
+    """Return ``'credential'``, ``'default_home'``, ``'safe_root'``, or ``None``
+    if writes are allowed."""
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
     if resolved in build_write_denied_paths(home):
         return "credential"
-    for prefix in build_write_denied_prefixes(home):
-        if resolved.startswith(prefix):
-            return "credential"
+    # t_4281c05c: credential vs readonly. Specific credential prefixes
+    # (.ssh, .aws, etc.) win over the broad default/home readonly prefix
+    # (~/ and <root>/). Check the narrow credential prefixes first, then
+    # the readonly classification, and skip the broad prefixes in the
+    # credential loop so that a plain ~/foo.txt gets the default_home
+    # reason (with its actionable readonly error) rather than the generic
+    # credential error.
+    try:
+        home_real = os.path.realpath(os.path.expanduser("~"))
+    except Exception:
+        home_real = home
+    try:
+        root_real = os.path.realpath(_hermes_root_path())
+    except Exception:
+        root_real = None
+
+    # Narrow credential prefixes (everything in build_write_denied_prefixes
+    # except the broad home/root readonly entries added for t_4281c05c).
+    broad_prefixes: set[str] = set()
+    if home_real:
+        broad_prefixes.add(home_real + os.sep)
+    if root_real:
+        broad_prefixes.add(root_real + os.sep)
+
+    # Kanban allowlist takes precedence over the readonly-home prefixes — see
+    # t_4281c05c. A kanban DB path under ~/ or ~/.hermes would otherwise be
+    # mis-classified via the broad prefix.
+    is_kanban = False
+    try:
+        is_kanban = _is_kanban_allowlisted(resolved)
+    except Exception:
+        pass
+    if not is_kanban:
+        for prefix in build_write_denied_prefixes(home):
+            if prefix in broad_prefixes:
+                continue  # handled via default_home branch below
+            if resolved.startswith(prefix):
+                return "credential"
 
     mcp_tokens_dir_name = "mcp-tokens"
 
@@ -155,6 +481,11 @@ def _classify_write_denial(path: str) -> Optional[str]:
         if not allowed:
             return "safe_root"
 
+    # default/home is readonly by default (reads unaffected). Checked last so
+    # the more specific credential / safe-root reasons win the error message.
+    if classify_default_home_write(resolved) is not None and not default_home_writes_allowed():
+        return "default_home"
+
     return None
 
 
@@ -173,6 +504,24 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
         return (
             f"{verb} denied: '{path}' is outside HERMES_WRITE_SAFE_ROOT "
             f"({roots_display}). Unset the variable or add this path's directory prefix."
+        )
+    if denial == "default_home":
+        info = classify_default_home_write(path) or {}
+        home_root = info.get("home_root", "the default Hermes home")
+        if info.get("kind") == "sandbox_mirror_home":
+            what = (
+                f"a sandbox-mirror home ({home_root}) — a per-task copy the host "
+                f"Hermes process never reads"
+            )
+        else:
+            what = f"the default profile's home ({home_root}), which is readonly by default"
+        return (
+            f"{verb} denied: '{path}' is inside {what}. Reads are allowed; writes "
+            f"require an explicit opt-in. Set "
+            f"{ALLOW_WRITE_DEFAULT_HOME_ENV}=1 for this task, or "
+            f"`file_safety.allow_write_default_home: true` in the Hermes config. "
+            f"Prefer host-side tools for authoritative state (e.g. ``memory`` for "
+            f"memories) or write under your own profile home instead."
         )
     return f"{verb} denied: '{path}' is a protected system/credential file."
 
