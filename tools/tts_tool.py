@@ -3480,12 +3480,28 @@ def _text_to_speech_single(
         return tool_error(error_msg, success=False)
 
 
+def _coerce_bool_arg(value: Any, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    s = str(value).strip().lower()
+    if s in ("1", "true", "yes", "on"):
+        return True
+    if s in ("0", "false", "no", "off"):
+        return False
+    return default
+
+
 def text_to_speech_tool(
     text: str,
     output_path: Optional[str] = None,
     speed: Optional[float] = None,
     instructions: Optional[str] = None,
     provider: Optional[str] = None,
+    resolve_task_ids: Optional[Any] = True,
 ) -> str:
     """Convert text to speech audio with long-form chunking.
 
@@ -3509,6 +3525,10 @@ def text_to_speech_tool(
         speed: Optional playback speed multiplier (0.25-4.0).
         instructions: Optional voice-design guidance (tone, emotion, pacing).
         provider: Optional TTS provider override.
+        resolve_task_ids: When True (default) any kanban task id of the form
+            ``t_`` + 8 hex chars is replaced with ``task - <title>`` before
+            synthesis; an unresolvable id fails the call with a clear error.
+            Set to False to leave ids verbatim.
 
     Returns:
         str: JSON result with success, file_path, file_paths, and MEDIA tag.
@@ -3516,11 +3536,23 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
+    _resolve_ids = _coerce_bool_arg(resolve_task_ids, True)
+
     # Normalize text via the shared cleaner: markdown, emoji, think blocks,
-    # verifier footer, units, newline flattening.
+    # verifier footer, units, newline flattening.  Unresolvable task ids
+    # raise ValueError which must surface as a tool error (not be swallowed).
     try:
         from tools.tts_text_normalize import prepare_spoken_text
-        text = prepare_spoken_text(text, max_chars=None)
+
+        text = prepare_spoken_text(
+            text, max_chars=None, resolve_task_ids=_resolve_ids
+        )
+    except ValueError as ve:
+        # Unresolvable task id — fail loudly so the caller fixes the reference.
+        msg = str(ve)
+        if "Unresolvable task id" in msg:
+            return tool_error(msg, success=False)
+        raise
     except Exception:
         text = text.strip()
     if not text:
@@ -4484,7 +4516,17 @@ TTS_SCHEMA = {
                     "names from tts.providers.<name>, or plugin-registered names. "
                     "When omitted, the configured tts.provider from config.yaml is used."
                 )
-            }
+            },
+            "resolve_task_ids": {
+                "type": "boolean",
+                "description": (
+                    "Replace kanban task ids (t_ + 8 hex, e.g. t_a1b2c3d4) with "
+                    "'task - <title>' looked up across all boards before synthesis. "
+                    "When true (default) an unresolvable id fails the call with a clear "
+                    "error; when false ids are left verbatim."
+                ),
+                "default": True,
+            },
         },
         "required": ["text"]
     }
@@ -4499,7 +4541,8 @@ registry.register(
         output_path=args.get("output_path"),
         speed=args.get("speed"),
         instructions=args.get("instructions"),
-        provider=args.get("provider")),
+        provider=args.get("provider"),
+        resolve_task_ids=args.get("resolve_task_ids", True)),
     check_fn=check_tts_requirements,
     emoji="🔊",
 )

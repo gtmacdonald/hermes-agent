@@ -258,7 +258,126 @@ def flatten_newlines_for_payload(text: str) -> str:
     return text.strip()
 
 
-def prepare_spoken_text(text: str, max_chars: int | None = 4000) -> str:
+# Kanban task ids are ``t_`` + 8 hex chars (``secrets.token_hex(4)`` in
+# ``hermes_cli/kanban_db._new_task_id``).  They are opaque for speech — a TTS
+# engine would read ``t_8b13866d`` as a jumble of letters and numbers.  The
+# spoken-id filter replaces each id with its human title: ``task - Foo bar``.
+# Unresolvable ids are a hard error (the caller must fix the reference, not
+# ship garbled speech).  Replacement happens after markdown stripping so ids
+# inside fenced code blocks (which are removed, not spoken) do not trigger
+# lookups or errors, but before symbol normalisation so ``5/t_xxx`` style
+# digit-slash-letter sequences are not mis-expanded as rates (``5 per ...``).
+_TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b", flags=re.IGNORECASE)
+
+
+def _lookup_task_title(task_id: str) -> str | None:
+    """Return the title for *task_id* by scanning every kanban board.
+
+    Boards are discovered via ``hermes_cli.kanban_db.list_boards`` so the
+    default board (``~/.hermes/kanban.db``) and every ``boards/<slug>/``
+    board are checked.  The first hit wins — ids are globally unique by
+    construction (``token_hex(4)``), so there is no ambiguity.
+    """
+    tid = task_id.lower()
+    try:
+        from hermes_cli import kanban_db
+    except Exception:
+        return None
+    try:
+        boards = kanban_db.list_boards(include_archived=True)
+    except Exception:
+        return None
+    for meta in boards:
+        slug = (meta.get("slug") or "").strip() or None
+        # ``connect(board=slug)`` honours the default-board special path and
+        # the kanban_home() resolution; fall back to an explicit db_path for
+        # any synthetic test board.
+        conn = None
+        try:
+            if slug:
+                conn = kanban_db.connect(board=slug)
+            else:
+                db_path = meta.get("db_path")
+                if not db_path:
+                    continue
+                from pathlib import Path as _Path
+
+                conn = kanban_db.connect(db_path=_Path(db_path))
+            task = kanban_db.get_task(conn, tid)
+            if task is not None and getattr(task, "title", None):
+                return str(task.title).strip()
+        except Exception:
+            continue
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return None
+
+
+def expand_task_ids_for_tts(text: str, *, strict: bool = True) -> str:
+    """Replace bare kanban task ids (``t_`` + 8 hex) with ``task - <title>``.
+
+    Args:
+        text: Already markdown-stripped text (code fences removed).
+        strict: When ``True`` (default) an id with no matching task raises
+            ``ValueError`` listing every unresolvable id.  When ``False``
+            unknown ids are left verbatim so callers that prefer best-effort
+            can still produce speech.
+
+    Number-context: the task id is consumed as a single atomic token
+    (``\\b``-bounded), so surrounding digits/punctuation are preserved and
+    the later ``normalize_symbols_for_tts`` pass never sees the raw hex as
+    a numeric rate, date, or percentage.  The replacement title itself is
+    returned verbatim — the normal symbol pass that follows will still
+    expand any numbers/units *inside* the title.
+    """
+    if not text or "t_" not in text.lower():
+        return text
+    # Collect unique ids case-insensitively but preserve first-seen casing for
+    # error messages.
+    seen: dict[str, str] = {}  # lower -> first raw form
+    for m in _TASK_ID_RE.finditer(text):
+        raw = m.group(0)
+        low = raw.lower()
+        if low not in seen:
+            seen[low] = raw
+    if not seen:
+        return text
+    # Resolve each unique id once.
+    resolved: dict[str, str | None] = {}
+    missing: list[str] = []
+    for low, raw in seen.items():
+        title = _lookup_task_title(low)
+        if title:
+            # Normalise whitespace in the title so a multi-line or double-
+            # spaced title does not inject extra pauses.
+            title = re.sub(r"\s+", " ", title).strip()
+            resolved[low] = f"task - {title}"
+        else:
+            resolved[low] = None
+            missing.append(raw)
+    if strict and missing:
+        missing_str = ", ".join(sorted(set(missing)))
+        raise ValueError(
+            f"Unresolvable task id(s) for TTS: {missing_str} — "
+            f"no matching task title found across boards. "
+            f"Fix the reference or set resolve_task_ids=false to leave ids verbatim."
+        )
+
+    def _repl(m: re.Match[str]) -> str:
+        low = m.group(0).lower()
+        rep = resolved.get(low)
+        return rep if rep is not None else m.group(0)
+
+    return _TASK_ID_RE.sub(_repl, text)
+
+
+def prepare_spoken_text(
+    text: str, max_chars: int | None = 4000, *, resolve_task_ids: bool = True
+) -> str:
     """Return a TTS-friendly script from assistant text.
 
     Deterministic cleanup, not a semantic rewrite: it removes ``<think>``
@@ -267,9 +386,55 @@ def prepare_spoken_text(text: str, max_chars: int | None = 4000) -> str:
     turns visual line formatting into speakable sentence pauses, and flattens
     the result to a single line so newline-sensitive providers (Kokoro) speak
     the whole script.
+
+    When ``resolve_task_ids`` is ``True`` (default) any bare kanban task id
+    of the form ``t_`` + 8 hex chars is replaced with ``task - <title>``
+    looked up across all boards; an unresolvable id raises ``ValueError``.
+    Set ``resolve_task_ids`` to ``False`` to leave ids verbatim (e.g. for
+    debugging or when the caller will resolve them itself).
     """
     spoken = strip_nonspoken_blocks(text)
+    # Task ids contain underscores (``t_8b13...``) which the Markdown
+    # underscore-italic pass (``_foo_`` -> ``foo``) would otherwise consume
+    # when two ids appear in one sentence (``t_a .. t_b`` looks like
+    # ``_a .. t_`` italic).  Protect ids with sentinels before the Markdown
+    # pass so ``_MD_UNDERSCORE_ITALIC_RE`` cannot eat them.  Ids inside
+    # fenced code blocks are removed with the block (no lookup, no error)
+    # because the sentinel is inside the `````...````` region that
+    # ``strip_markdown_for_tts`` replaces with a space.
+    _sentinels: dict[str, str] = {}
+    if resolve_task_ids and text and "t_" in str(text).lower():
+        # Use a sentinel with no underscores/spaces so no Markdown rule
+        # touches it.  ``\\x01`` is already the heading sentinel and never
+        # appears in user text.
+        def _to_sentinel(m: re.Match[str]) -> str:
+            tok = f"\x01TASK{len(_sentinels)}\x01"
+            _sentinels[tok] = m.group(0)
+            return tok
+
+        spoken = _TASK_ID_RE.sub(_to_sentinel, spoken)
     spoken = strip_markdown_for_tts(spoken)
+    if _sentinels:
+        for tok, raw in _sentinels.items():
+            spoken = spoken.replace(tok, raw)
+        # Number-context: a digit-slash-id like ``5/t_8b13866d`` must not be
+        # expanded as a numeric rate (``5 per t_...``) by the symbol pass.
+        # Convert the slash to a spoken pause before the id is resolved, so
+        # the later ``normalize_symbols_for_tts`` rate rule never sees it.
+        # ``5/t_xxx`` -> ``5 , t_xxx`` -> ``5 , task - Title``.
+        spoken = re.sub(
+            r"(?<=\d)\s*/\s*(?=t_[0-9a-f]{8}\b)",
+            " , ",
+            spoken,
+            flags=re.IGNORECASE,
+        )
+        spoken = expand_task_ids_for_tts(spoken, strict=True)
+    elif resolve_task_ids:
+        # No sentinel was created (no ``t_`` in the original), but still
+        # handle any ids that survived markdown stripping (e.g. introduced
+        # elsewhere).  This path is cheap — ``expand`` early-returns when
+        # no ``t_`` is present.
+        spoken = expand_task_ids_for_tts(spoken, strict=True)
     spoken = normalize_symbols_for_tts(spoken)
     spoken = smooth_whitespace_for_tts(spoken)
     spoken = flatten_newlines_for_payload(spoken)
