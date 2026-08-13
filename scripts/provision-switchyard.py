@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""switchyard-evaluate.py — probe what's live, regenerate USE-CASE routes.
+"""provision-switchyard.py — probe what's live, regenerate USE-CASE routes.
 
 Supersedes ensure-switchyard.py's route authoring. Design (Greg, 2026-08-13):
 no model-alias passthroughs — every route is a hermes use case, and a CAPABLE
@@ -17,8 +17,8 @@ refreshes the `switchyard` provider block in every hermes profile config
 that already has one.
 
 Usage:
-  switchyard-evaluate.py            # probe → write → validate → restart → sync provider blocks
-  switchyard-evaluate.py --dry-run  # probe + print the plan, change nothing
+  provision-switchyard.py            # probe → write → validate → restart → sync provider blocks
+  provision-switchyard.py --dry-run  # probe + print the plan, change nothing
 """
 from __future__ import annotations
 
@@ -167,7 +167,7 @@ def build_routes(live: dict) -> str:
         sys.exit("✗ cannot build routes:\n  " + "\n  ".join(errors))
 
     parts = ["# Switchyard routes — USE-CASE routing, one route per hermes job.",
-             "# Managed by scripts/switchyard-evaluate.py (fork: ~/src/hermes). Rerun to re-evaluate.",
+             "# Managed by scripts/provision-switchyard.py (fork: ~/src/hermes). Rerun to re-evaluate.",
              "# No model-alias passthroughs by design (Greg, 2026-08-13).", "",
              "schema_version = 1", ""]
     for cname in sorted({MODELS[u]["client"] for u in used}):
