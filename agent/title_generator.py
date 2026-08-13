@@ -5,6 +5,7 @@ adds latency to the user-facing reply.
 """
 
 import logging
+import re
 import threading
 from typing import Callable, Optional
 
@@ -52,6 +53,117 @@ def _title_language() -> str:
         ).strip()
     except Exception:
         return ""
+
+
+def _model_short_code(model: str | None, provider: str | None = None) -> str:
+    """Map a model/provider string to a 2-4 char session-title prefix.
+
+    User contract (always-on):
+      DS   = DeepSeek family
+      MUSE = Hermes family (muse / glimmer / hermes)
+    Other families get short stable codes so every auto-title carries its
+    model context at a glance.
+    """
+    raw = (model or "").strip()
+    prov = (provider or "").strip()
+    # Combine for matching but prefer model
+    hay = f"{raw} {prov}".lower()
+    if not hay.strip():
+        return ""
+    if "deepseek" in hay:
+        return "DS"
+    if "muse" in hay or "glimmer" in hay or "hermes" in hay:
+        return "MUSE"
+    if "claude" in hay:
+        return "CC"
+    if "kimi" in hay:
+        return "KI"
+    if "switchyard" in hay:
+        return "SY"
+    if "seed" in hay or "bytedance" in hay:
+        return "SD"
+    if "grok" in hay:
+        return "GK"
+    if "gemini" in hay:
+        return "GM"
+    if "gpt" in hay or "openai" in hay or "luna" in hay:
+        return "GPT"
+    # Fallback: derive 2-char code from model base name
+    base = (raw.split("/")[-1] if raw else prov).split(":")[0].strip()
+    alnum = "".join(c for c in base if c.isalnum())
+    if len(alnum) >= 2:
+        return alnum[:2].upper()
+    if alnum:
+        return alnum.upper()[:4]
+    return ""
+
+
+def _normalize_title_body(text: str) -> str:
+    """Uppercase, no punctuation — per user always-on rule."""
+    if not text:
+        return ""
+    s = " ".join(text.split())
+    s = s.upper()
+    # Remove anything that is not A-Z0-9 or space
+    s = re.sub(r"[^A-Z0-9 ]+", "", s)
+    s = " ".join(s.split())
+    return s.strip()
+
+
+def _next_code_number(session_db, code: str) -> int:
+    """Next sequential number for CODE, scanning existing numbered titles only."""
+    if not code:
+        return 1
+    code_up = code.upper()
+    max_n = 0
+    try:
+        titles: list[str] = []
+        if hasattr(session_db, "_conn") and hasattr(session_db, "_lock"):
+            with session_db._lock:
+                cur = session_db._conn.execute("SELECT title FROM sessions WHERE title IS NOT NULL")
+                titles = [row[0] for row in cur.fetchall() if row[0]]
+        elif hasattr(session_db, "list_sessions_rich"):
+            rows = session_db.list_sessions_rich(limit=2000)
+            titles = [r.get("title") for r in rows if r.get("title")]
+        pat = re.compile(rf"^{re.escape(code_up)}#(\d+):", re.IGNORECASE)
+        for title in titles:
+            m = pat.match((title or "").strip())
+            if m:
+                try:
+                    n = int(m.group(1))
+                    if n > max_n:
+                        max_n = n
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return max_n + 1
+
+
+def _prefix_title_with_code(title: str, code: str, number: int | None = None) -> str:
+    """Prefix title with 'CODE#N: ' (always numbered), all-caps body, keeping ≤80 chars."""
+    if not code or not title:
+        return title
+    title = _normalize_title_body(title) or title
+    low = title.lower()
+    c_low = code.lower()
+    if low.startswith(f"{c_low}#") or low.startswith(f"{c_low}:") or low.startswith(f"[{c_low}]"):
+        return title
+    if number is not None:
+        prefix = f"{code}#{number}: "
+    else:
+        prefix = f"{code}: "
+    max_len = 80
+    if len(prefix) + len(title) > max_len:
+        avail = max_len - len(prefix)
+        if avail <= 0:
+            return title
+        if avail < len(title):
+            if avail > 3:
+                title = title[: avail - 3].rstrip() + "..."
+            else:
+                title = title[:avail]
+    return f"{prefix}{title}"
 
 
 def _auto_title_enabled() -> bool:
@@ -169,9 +281,10 @@ def generate_title(
         # otherwise be stored verbatim and truncated mid-command. Keep the first
         # non-empty line — the closest thing to a title in that response.
         title = next((line.strip() for line in title.splitlines() if line.strip()), "")
+        title = _normalize_title_body(title)
         # Enforce reasonable length
         if len(title) > 80:
-            title = title[:77] + "..."
+            title = title[:77].rstrip() + "..."
         return title if title else None
     except Exception as e:
         # Log at WARNING so this shows up in agent.log without debug mode.
@@ -338,6 +451,27 @@ def _auto_title_session(
     )
     if not title:
         return
+
+    # Always prefix with short model code + number, all caps no punctuation.
+    title = _normalize_title_body(title) or title
+    rt = main_runtime or {}
+    code = _model_short_code(rt.get("model") or rt.get("provider") or "", rt.get("provider"))
+    # main_runtime sometimes carries model in "provider" slot or vice-versa; try both
+    if not code:
+        # Fall back to session row's model when main_runtime was empty (e.g. retitle path)
+        try:
+            sess = session_db.get_session(session_id) if hasattr(session_db, "get_session") else None
+            if sess and (sess.get("model") or sess.get("billing_provider")):
+                code = _model_short_code(sess.get("model"), sess.get("billing_provider"))
+        except Exception:
+            pass
+    if code:
+        n = _next_code_number(session_db, code)
+        low_t = title.lower()
+        c_low = code.lower()
+        if not (low_t.startswith(f"{c_low}#") or low_t.startswith(f"{c_low}:") or low_t.startswith(f"[{c_low}]")):
+            title = _prefix_title_with_code(title, code, n)
+        # on collision the dedup handler below will bump to next number
 
     try:
         persisted = _persist_session_title(session_db, session_id, title)
