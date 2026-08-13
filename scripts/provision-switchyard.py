@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """provision-switchyard.py — probe what's live, regenerate USE-CASE routes.
 
-Supersedes ensure-switchyard.py's route authoring. Design (Greg, 2026-08-13):
-no model-alias passthroughs — every route is a hermes use case, and a CAPABLE
-model does the arbitration (a wrong route = a failed, confused session):
+Supersedes ensure-switchyard.py's route authoring. Design (Greg, 2026-08-13,
+revised same day): switchyard exists for AUTOMATIC DISPATCH ONLY. A static
+model pin needs no router — fixed lanes (titles, compaction, effort) are set
+directly in hermes config. The only routes here are ones that CHOOSE, and a
+CAPABLE model does the choosing (a wrong route = a failed, confused session):
 
-    hermes-main        llm_classifier — judge (haiku/luna) picks weak vs strong
-    hermes-titles      first live cheap/fast model
-    hermes-compaction  first live long-context cheap model
+    hermes-main   llm_classifier — judge (haiku/luna) picks weak vs strong
 
 Edit MODELS and USE_CASES to taste, rerun. Deterministic and idempotent:
 probes each catalog model with a 1-token call (keys from ~/.hermes/.env),
@@ -62,6 +62,10 @@ MODELS = {
 # One route per hermes use case. Preference lists: first LIVE model wins.
 # kind=classifier → llm_classifier (judge/weak/strong); kind=fixed → single target.
 USE_CASES = {
+    # Automatic dispatch ONLY (Greg, 2026-08-13): fixed lanes live in hermes
+    # config. Add a row here only for a route that chooses by itself.
+    # (haiku stays judge-only: it rejects reasoning params via the anthropic
+    # translation — kimi/deepseek verified param-tolerant as serving targets.)
     "hermes-main": {
         "kind": "classifier",
         "judge": ["haiku", "luna"],          # capable arbitration until deepseek is vetted
@@ -70,24 +74,6 @@ USE_CASES = {
         "threshold": 0.5,
         "affinity": True,
     },
-    "hermes-titles":     {"kind": "fixed", "prefer": ["qwen4b", "kimi"]},  # local-first (Greg, 2026-08-13)
-    "hermes-compaction": {"kind": "fixed", "prefer": ["kimi", "deepseek"]},
-    # Effort tiers — names match hermes /reasoning levels 1:1 (Greg, 2026-08-13).
-    # Serving models must TOLERATE reasoning params (agent.reasoning_overrides
-    # pins one per tier): kimi and deepseek verified OK; haiku REJECTS every
-    # effort value via switchyard's anthropic translation ("adaptive thinking
-    # is not supported") — haiku is judge-only, never a serving target.
-    # Depth within the kimi band comes from the override, not the model.
-    **{f"hermes-{lvl}": {"kind": "fixed", "prefer": prefs} for lvl, prefs in {
-        "none":    ["kimi", "qwen4b"],
-        "minimal": ["kimi", "qwen4b"],
-        "low":     ["kimi", "qwen4b"],
-        "medium":  ["kimi", "deepseek"],
-        "high":    ["deepseek", "spark"],
-        "xhigh":   ["deepseek", "spark"],
-        "max":     ["deepseek", "spark"],
-        "ultra":   ["deepseek", "spark"],
-    }.items()},
 }
 
 PROBE_TIMEOUT = 25
