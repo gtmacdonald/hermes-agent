@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
+    DEFAULT_PROFILE_ORCHESTRATOR_GUIDANCE,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
@@ -40,12 +41,14 @@ from agent.prompt_builder import (
     PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
+    SKILL_SAFETY_RULE,
     SKILLS_GUIDANCE,
     STEER_CHANNEL_NOTE,
     TASK_COMPLETION_GUIDANCE,
     TELEGRAM_RICH_MESSAGES_HINT,
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
+    TTS_SPOKEN_GUIDANCE,
     drain_truncation_warnings,
 )
 from agent.runtime_cwd import resolve_context_cwd
@@ -229,6 +232,8 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(MEMORY_GUIDANCE)
     if "session_search" in agent.valid_tool_names:
         tool_guidance.append(SESSION_SEARCH_GUIDANCE)
+    if "text_to_speech" in agent.valid_tool_names:
+        tool_guidance.append(TTS_SPOKEN_GUIDANCE)
     if "skill_manage" in agent.valid_tool_names:
         tool_guidance.append(SKILLS_GUIDANCE)
     # Kanban worker/orchestrator lifecycle — only present when the
@@ -243,6 +248,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(KANBAN_GUIDANCE)
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
+    # Skill safety rule is a separate stable block so it never sits
+    # adjacent to the TTS spoken-form guidance — the spoken guidance is
+    # deliberately the boundary between SKILLS guidance and the safety rule.
+    if "skill_manage" in agent.valid_tool_names:
+        stable_parts.append(SKILL_SAFETY_RULE)
 
     # Steering only lands inside tool results, so it's only reachable when the
     # agent has tools. Static text → byte-stable prompt (no cache hit).
@@ -415,6 +425,10 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             "skills/plugins/cron/memories unless the user explicitly directs "
             "you to."
         )
+        # t_dd155343 — default-profile orchestrator override. Gated on
+        # profile_name == "default" so non-default prompts are byte-identical
+        # to before (regression-guarded in tests/agent/test_system_prompt.py).
+        post_workspace_parts.append(DEFAULT_PROFILE_ORCHESTRATOR_GUIDANCE)
     else:
         post_workspace_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "

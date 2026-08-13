@@ -261,12 +261,17 @@ def flatten_newlines_for_payload(text: str) -> str:
 # Kanban task ids are ``t_`` + 8 hex chars (``secrets.token_hex(4)`` in
 # ``hermes_cli/kanban_db._new_task_id``).  They are opaque for speech — a TTS
 # engine would read ``t_8b13866d`` as a jumble of letters and numbers.  The
-# spoken-id filter replaces each id with its human title: ``task - Foo bar``.
+# spoken-id filter replaces each id with its human title: ``task "Foo bar"``.
 # Unresolvable ids are a hard error (the caller must fix the reference, not
 # ship garbled speech).  Replacement happens after markdown stripping so ids
 # inside fenced code blocks (which are removed, not spoken) do not trigger
 # lookups or errors, but before symbol normalisation so ``5/t_xxx`` style
 # digit-slash-letter sequences are not mis-expanded as rates (``5 per ...``).
+# Hermes skill is one-shot: every bare t_XXXXXXXX auto-resolves here to
+# ``task "Title"`` before synthesis — min quality is never reading the hex as
+# numbers.  In one-shot mode unspeakable content should surface as a
+# playwright direction ``(mumbles)`` via the instruction channel when available
+# (see speak_server.py leading ``(...)`` → voicedesign ``instruct``).
 _TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b", flags=re.IGNORECASE)
 
 
@@ -318,7 +323,7 @@ def _lookup_task_title(task_id: str) -> str | None:
 
 
 def expand_task_ids_for_tts(text: str, *, strict: bool = True) -> str:
-    """Replace bare kanban task ids (``t_`` + 8 hex) with ``task - <title>``.
+    """Replace bare kanban task ids (``t_`` + 8 hex) with ``task "<title>"``.
 
     Args:
         text: Already markdown-stripped text (code fences removed).
@@ -330,9 +335,11 @@ def expand_task_ids_for_tts(text: str, *, strict: bool = True) -> str:
     Number-context: the task id is consumed as a single atomic token
     (``\\b``-bounded), so surrounding digits/punctuation are preserved and
     the later ``normalize_symbols_for_tts`` pass never sees the raw hex as
-    a numeric rate, date, or percentage.  The replacement title itself is
-    returned verbatim — the normal symbol pass that follows will still
-    expand any numbers/units *inside* the title.
+    a numeric rate, date, or percentage.  The replacement itself is the
+    spoken form — ``task "Title"`` (quoted).  The normal symbol pass that
+    follows still expands any numbers/units *inside* the Title; one-shot
+    mode may also emit a leading ``(mumbles)`` direction for unspeakable
+    content via the instruction channel when available (hermes-voicedesign).
     """
     if not text or "t_" not in text.lower():
         return text
@@ -353,9 +360,12 @@ def expand_task_ids_for_tts(text: str, *, strict: bool = True) -> str:
         title = _lookup_task_title(low)
         if title:
             # Normalise whitespace in the title so a multi-line or double-
-            # spaced title does not inject extra pauses.
-            title = re.sub(r"\s+", " ", title).strip()
-            resolved[low] = f"task - {title}"
+            # spaced title does not inject extra pauses.  Escape any
+            # double-quotes in the title so the spoken form
+            # ``task "Title"`` stays well-formed for TTS (quotes are
+            # just spoken pauses).
+            title = re.sub(r"\s+", " ", title).strip().replace('"', "'")
+            resolved[low] = f'task "{title}"'
         else:
             resolved[low] = None
             missing.append(raw)
@@ -388,10 +398,14 @@ def prepare_spoken_text(
     the whole script.
 
     When ``resolve_task_ids`` is ``True`` (default) any bare kanban task id
-    of the form ``t_`` + 8 hex chars is replaced with ``task - <title>``
-    looked up across all boards; an unresolvable id raises ``ValueError``.
-    Set ``resolve_task_ids`` to ``False`` to leave ids verbatim (e.g. for
-    debugging or when the caller will resolve them itself).
+    of the form ``t_`` + 8 hex chars is replaced with ``task "<title>"``
+    (quoted) looked up across all boards; an unresolvable id raises ``ValueError``.
+    Min quality: ids are never spoken as numbers. Set ``resolve_task_ids``
+    to ``False`` to leave ids verbatim (e.g. for debugging or when the
+    caller will resolve them itself). The hermes skill is one-shot: every
+    bare ``t_XXXXXXXX`` auto-resolves to ``task "title"`` — and in one-shot
+    mode unspeakable content surfaces as ``(mumbles)`` via the instruction
+    channel when available (syndicate voicedesign / hermes-voicedesign).
     """
     spoken = strip_nonspoken_blocks(text)
     # Task ids contain underscores (``t_8b13...``) which the Markdown
@@ -421,7 +435,7 @@ def prepare_spoken_text(
         # expanded as a numeric rate (``5 per t_...``) by the symbol pass.
         # Convert the slash to a spoken pause before the id is resolved, so
         # the later ``normalize_symbols_for_tts`` rate rule never sees it.
-        # ``5/t_xxx`` -> ``5 , t_xxx`` -> ``5 , task - Title``.
+        # ``5/t_xxx`` -> ``5 , t_xxx`` -> ``5 , task "Title"``.
         spoken = re.sub(
             r"(?<=\d)\s*/\s*(?=t_[0-9a-f]{8}\b)",
             " , ",

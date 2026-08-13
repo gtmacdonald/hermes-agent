@@ -138,6 +138,10 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         valid_tool_names=["read_file"],
         _parallel_tool_call_guidance=False,
     )
+    # Pin the top three stable blocks to short sentinels so the expected
+    # string is deterministic and the rest of the test only asserts ordering
+    # of the coding/identity/control tiers (the contract under test), not the
+    # current length of the stock identity boilerplate.
     monkeypatch.setattr(system_prompt, "DEFAULT_AGENT_IDENTITY", "IDENTITY")
     monkeypatch.setattr(system_prompt, "HERMES_AGENT_HELP_GUIDANCE", "HELP")
     monkeypatch.setattr(system_prompt, "STEER_CHANNEL_NOTE", "STEER")
@@ -150,6 +154,13 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         "this one. Do not modify another profile's skills/plugins/cron/memories "
         "unless the user explicitly directs you to."
     )
+    from agent.prompt_builder import DEFAULT_PROFILE_ORCHESTRATOR_GUIDANCE
+    expected_orch = DEFAULT_PROFILE_ORCHESTRATOR_GUIDANCE.strip()
+    # Stable tier: coding prefix stays in the stable band. When a workspace
+    # snapshot exists (as it does here — CODING_STABLE/WORKSPACE/operator are
+    # all non-empty), WORKSPACE + trailing + post-workspace blocks all move
+    # into the context tier together, so profile/orchestrator appear before
+    # WORKSPACE in the final joined prompt (stable+context+volatile).
     expected = "\n\n".join((
         "IDENTITY",
         "HELP",
@@ -158,6 +169,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         "WORKSPACE",
         "Operator instructions (from config):\nOPERATOR",
         expected_profile,
+        expected_orch,
         "SYSTEM_MESSAGE",
         "CONTEXT_FILES",
         "Conversation started: Friday, January 02, 2026",
@@ -339,3 +351,67 @@ class TestSkillsInVolatileBand:
         full = _build(build_system_prompt)
         assert full.index(_CONTEXT) < full.index(_SKILLS)
         assert full.index(_SKILLS) < full.index("Conversation started:")
+
+
+class TestDefaultProfileOrchestratorGuidance:
+    """t_dd155343 — default profile gets the orchestrator prompt override.
+
+    Non-default profiles must be byte-identical to before (regression guard).
+    The default prompt must surface the four acceptance points:
+      1. orchestrator / cross-profile coordinator role
+      2. READONLY for ~/ and the default/home .hermes dir (reads allowed, writes denied unless opted in)
+      3. only writable surface is kanban boards, and they are cross-profile (all boards)
+      4. other profiles remain profile-scoped / unaffected
+    """
+
+    def _stable(self, active_profile: str) -> str:
+        agent = _make_agent()
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+            patch("agent.file_safety._resolve_active_profile_name", return_value=active_profile),
+        ):
+            return build_system_prompt_parts(agent)["stable"]
+
+    def test_non_default_excludes_orchestrator_guidance(self):
+        stable = self._stable("studio")
+        assert "Default-profile orchestrator" not in stable
+        assert "cross-profile orchestrator" not in stable
+        assert "READONLY by default" not in stable
+        assert "HERMES_ALLOW_WRITE_DEFAULT_HOME" not in stable
+
+    def test_default_includes_orchestrator_guidance(self):
+        stable = self._stable("default")
+        assert "Default-profile orchestrator" in stable
+        assert "cross-profile" in stable.lower()
+        assert "orchestrator / coordinator" in stable
+        assert "READONLY by default" in stable
+        assert "HERMES_ALLOW_WRITE_DEFAULT_HOME" in stable
+        assert "file_safety.allow_write_default_home" in stable
+        assert "only writable surface" in stable.lower()
+        assert "kanban" in stable.lower()
+        assert "Other profiles" in stable or "other profiles" in stable.lower()
+
+    def test_non_default_byte_identical_to_before(self):
+        """Patching in the default override must not touch non-default output at all."""
+        from agent.prompt_builder import DEFAULT_PROFILE_ORCHESTRATOR_GUIDANCE
+
+        assert DEFAULT_PROFILE_ORCHESTRATOR_GUIDANCE not in self._stable("studio")
+        # Two successive builds for the same profile must match exactly (cache stability).
+        a = self._stable("studio")
+        b = self._stable("studio")
+        assert a == b
+
+    def test_default_diff_is_exactly_one_block(self):
+        from agent.prompt_builder import DEFAULT_PROFILE_ORCHESTRATOR_GUIDANCE
+
+        studio = self._stable("studio")
+        default = self._stable("default")
+        # Removing the orchestrator block from the default stable must yield
+        # something that — modulo that block — is the non-default stable plus
+        # the default-vs-named active-profile line difference. The cheap
+        # invariant: DEFAULT guidance appears exactly once in default and never in non-default.
+        assert default.count(DEFAULT_PROFILE_ORCHESTRATOR_GUIDANCE.strip()) == 1
+        assert studio.count(DEFAULT_PROFILE_ORCHESTRATOR_GUIDANCE.strip()) == 0

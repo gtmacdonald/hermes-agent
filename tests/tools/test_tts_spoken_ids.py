@@ -22,7 +22,7 @@ class TestExpandTaskIds:
             "tools.tts_text_normalize._lookup_task_title", return_value="Do the thing"
         ):
             assert (
-                expand_task_ids_for_tts("see t_8b13866d now") == "see task - Do the thing now"
+                expand_task_ids_for_tts("see t_8b13866d now") == 'see task "Do the thing" now'
             )
 
     def test_unresolvable_strict_raises(self):
@@ -53,7 +53,7 @@ class TestExpandTaskIds:
             "tools.tts_text_normalize._lookup_task_title", return_value="Case Task"
         ) as lookup:
             out = expand_task_ids_for_tts("See T_8B13866D now")
-            assert "task - Case Task" in out
+            assert 'task "Case Task"' in out
             # lookup is case-normalized
             assert lookup.call_args[0][0] == "t_8b13866d"
 
@@ -64,7 +64,7 @@ class TestExpandTaskIds:
             "tools.tts_text_normalize._lookup_task_title", return_value="My Cool Task"
         ) as lookup:
             out = expand_task_ids_for_tts("t_8b13866d and t_8b13866d again")
-            assert out.count("task - My Cool Task") == 2
+            assert out.count('task "My Cool Task"') == 2
             assert lookup.call_count == 1  # deduped lookup
 
     def test_word_boundary_only(self):
@@ -89,7 +89,7 @@ class TestPrepareSpokenTaskIds:
             "tools.tts_text_normalize._lookup_task_title", return_value="My Cool Task"
         ):
             s = prepare_spoken_text("see t_8b13866d please")
-            assert "task - My Cool Task" in s
+            assert 'task "My Cool Task"' in s
             assert "t_8b13866d" not in s.lower()
 
     def test_resolve_false_leaves_verbatim(self):
@@ -97,7 +97,7 @@ class TestPrepareSpokenTaskIds:
 
         s = prepare_spoken_text("see t_8b13866d now", resolve_task_ids=False)
         assert "t_8b13866d" in s
-        assert "task -" not in s
+        assert 'task "' not in s
 
     def test_unresolvable_raises(self):
         from tools.tts_text_normalize import prepare_spoken_text
@@ -114,7 +114,7 @@ class TestPrepareSpokenTaskIds:
 
         # Id inside a fenced code block is stripped with the block — no error
         s = prepare_spoken_text("before\n```\nt_8b13866d\n```\nafter")
-        assert "task -" not in s
+        assert 'task "' not in s
         assert "t_8b13866d" not in s.lower()
         assert "before" in s and "after" in s
 
@@ -127,7 +127,7 @@ class TestPrepareSpokenTaskIds:
             "tools.tts_text_normalize._lookup_task_title", return_value="My Cool Task"
         ):
             s = prepare_spoken_text("t_8b13866d and t_aabbccdd done")
-            assert s.count("task - My Cool Task") == 2
+            assert s.count('task "My Cool Task"') == 2
 
     def test_number_context_slash_not_expanded_as_rate(self):
         from tools.tts_text_normalize import prepare_spoken_text
@@ -137,7 +137,7 @@ class TestPrepareSpokenTaskIds:
         ):
             s = prepare_spoken_text("fix 5/t_8b13866d please")
             assert "5 per" not in s
-            assert "task - My Cool Task" in s
+            assert 'task "My Cool Task"' in s
             # still allows real rates
             s2 = prepare_spoken_text("cost is $5/month ok", resolve_task_ids=False)
             assert "5 dollars per month" in s2
@@ -157,7 +157,7 @@ class TestPrepareSpokenTaskIds:
         s = prepare_spoken_text("hello world", resolve_task_ids=True)
         assert "hello world" in s
         # no raw id leaked, no task prefix injected
-        assert "task -" not in s
+        assert 'task "' not in s
 
     def test_date_and_rate_guards_still_hold(self):
         from tools.tts_text_normalize import prepare_spoken_text

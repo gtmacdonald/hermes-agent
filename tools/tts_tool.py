@@ -3526,9 +3526,14 @@ def text_to_speech_tool(
         instructions: Optional voice-design guidance (tone, emotion, pacing).
         provider: Optional TTS provider override.
         resolve_task_ids: When True (default) any kanban task id of the form
-            ``t_`` + 8 hex chars is replaced with ``task - <title>`` before
-            synthesis; an unresolvable id fails the call with a clear error.
-            Set to False to leave ids verbatim.
+            ``t_`` + 8 hex chars is replaced with ``task "<title>"`` (quoted)
+            before synthesis — the hermes skill is one-shot so every bare
+            ``t_XXXXXXXX`` auto-resolves; min quality is never reading hex as
+            numbers. In one-shot mode unspeakable content may surface as a
+            playwright-style ``(mumbles)`` direction via the instruction
+            channel when available (see tools/tts_text_normalize.py). An
+            unresolvable id fails the call with a clear error. Set to False
+            to leave ids verbatim.
 
     Returns:
         str: JSON result with success, file_path, file_paths, and MEDIA tag.
@@ -4482,13 +4487,35 @@ from tools.registry import registry, tool_error
 
 TTS_SCHEMA = {
     "name": "text_to_speech",
-    "description": "Convert text to speech audio. Returns a MEDIA: path that the platform delivers as native audio. Compatible providers render as a voice bubble on Telegram; otherwise audio is sent as a regular attachment. In CLI mode, saves to ~/voice-memos/. Voice and provider are user-configured (built-in providers like edge/openai or custom command providers under tts.providers.<name>), not model-selected.",
+    "description": (
+        "Convert text to speech audio. Returns a MEDIA: path that the platform "
+        "delivers as native audio. Compatible providers render as a voice bubble "
+        "on Telegram; otherwise audio is sent as a regular attachment. In CLI "
+        "mode, saves to ~/voice-memos/. Voice and provider are user-configured "
+        "— not model-selected. The TTS argument is read VERBATIM: pass a "
+        "spoken-form script (deterministic Markdown/think-block/task-id cleanup "
+        "runs automatically, but the model owns the semantic rephrase — strip "
+        "tables/code/JSON/URLs/hashes, describe code in words, turn lists into "
+        "sentences, replace opaque ids; if you would stumble reading it aloud, "
+        "rephrase it before calling)."
+    ),
     "parameters": {
         "type": "object",
         "properties": {
             "text": {
                 "type": "string",
-                "description": "The text to convert to speech. Provider-specific per-request character caps apply automatically (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k depending on model); longer input is split into ordered chunks without silent truncation."
+                "description": (
+                    "The spoken script. Provider-specific per-request character "
+                    "caps apply automatically (OpenAI 4096, xAI 15000, MiniMax "
+                    "10000, ElevenLabs 5k-40k depending on model); longer input is "
+                    "split into ordered chunks without silent truncation. CLEANUP "
+                    "RULE: the model must cleanup/rephrase anything not speakable "
+                    "before calling — strip tables/code/JSON/URLs, describe code in "
+                    "natural words, replace hashes/ids with human names, turn lists "
+                    "into flowing sentences; read it in your head and rephrase "
+                    "until it flows (deterministic Markdown/think-block/task-id "
+                    "normalisation runs as a fallback, not a substitute)."
+                )
             },
             "output_path": {
                 "type": "string",
@@ -4521,9 +4548,12 @@ TTS_SCHEMA = {
                 "type": "boolean",
                 "description": (
                     "Replace kanban task ids (t_ + 8 hex, e.g. t_a1b2c3d4) with "
-                    "'task - <title>' looked up across all boards before synthesis. "
-                    "When true (default) an unresolvable id fails the call with a clear "
-                    "error; when false ids are left verbatim."
+                    "'task \"<title>\"' (quoted) looked up across all boards before synthesis. "
+                    "Hermes skill is one-shot — every bare t_XXXXXXXX auto-resolves; "
+                    "min quality is never reading the hex as numbers. In one-shot mode "
+                    "unspeakable content surfaces as (mumbles) via the instruction channel "
+                    "when available (voicedesign / hermes-voicedesign). When true (default) "
+                    "an unresolvable id fails the call with a clear error; when false ids are left verbatim."
                 ),
                 "default": True,
             },
