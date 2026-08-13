@@ -1316,12 +1316,22 @@ def _generate_command_tts(
     provider_name: str,
     config: Dict[str, Any],
     tts_config: Dict[str, Any],
+    *,
+    instructions: Optional[str] = None,
 ) -> str:
     """Generate speech by running a user-configured shell command.
 
     Returns the absolute path of the audio file the command wrote.
     Raises ``ValueError`` when the provider config is invalid, and
     ``RuntimeError`` for timeouts / non-zero exits / empty output.
+
+    ``instructions`` (voice-design direction, e.g. "(quiet aside)") is
+    substituted as ``{instructions}`` in the command template when
+    present — same lane as syndicate's ``speak_server.py`` leading
+    ``(...)`` → ``instruct``.  When ``instructions`` is falsy and the
+    template contains ``{instructions}``, it is substituted with an
+    empty string so the command still runs without an unbound
+    placeholder.
     """
     command_template = str(config.get("command") or "").strip()
     if not command_template:
@@ -1337,10 +1347,34 @@ def _generate_command_tts(
     timeout = _get_command_tts_timeout(config)
     output_format = _get_command_tts_output_format(config, str(output))
     speed = config.get("speed", tts_config.get("speed", ""))
+    # Voice-design instructions (syndicate's vocal-design lane): when the
+    # caller supplies ``instructions`` they are forwarded as
+    # ``{instructions}`` so speak_server.py can route them as
+    # ``--instruct`` → ``instruct`` (voicedesign) or strip them on kokoro.
+    # Fall back to a per-provider ``instructions`` config value (useful for
+    # engine-wide defaults) and otherwise an empty string so
+    # ``{instructions}`` in a template never becomes an unbound placeholder.
+    instructions_val = instructions if instructions is not None else str(
+        config.get("instructions", config.get("instruct", ""))
+    ).strip() or ""
+
+    # Syndicate lane: same as speak_server.py leading "(...)" → instruct.
+    # When instructions are supplied (model's `instructions` param or
+    # per-provider config), prepend as a leading stage direction so
+    # speak_server.py's split_direction() routes it to voicedesign/Qwen3
+    # via `instruct` (acted on, never voiced). On Kokoro the direction
+    # is stripped, so it never leaks as literal words. Keep
+    # {instructions}/{instruct} placeholders for templates that want them
+    # explicitly (e.g. --instruct "{instructions}").
+    effective_text = text
+    if instructions_val:
+        # Avoid double-wrapping if text already starts with (...) / [...]
+        if not re.match(r"^\s*[(\[]", effective_text):
+            effective_text = f"({instructions_val}) {effective_text}"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         text_path = Path(tmpdir) / "input.txt"
-        text_path.write_text(text, encoding="utf-8")
+        text_path.write_text(effective_text, encoding="utf-8")
 
         placeholders = {
             "input_path": str(text_path),
@@ -1350,6 +1384,8 @@ def _generate_command_tts(
             "voice": str(config.get("voice", "")),
             "model": str(config.get("model", "")),
             "speed": str(speed),
+            "instructions": instructions_val,
+            "instruct": instructions_val,
         }
         command = _render_command_tts_template(command_template, placeholders)
 
@@ -3253,7 +3289,12 @@ def _text_to_speech_single(
                 "Generating speech with command TTS provider '%s'...", provider,
             )
             file_str = _generate_command_tts(
-                text, file_str, provider, command_provider_config, tts_config,
+                text,
+                file_str,
+                provider,
+                command_provider_config,
+                tts_config,
+                instructions=instructions,
             )
 
         # Plugin-registered TTS backend (issue #30398). Fires when the

@@ -262,16 +262,19 @@ def flatten_newlines_for_payload(text: str) -> str:
 # ``hermes_cli/kanban_db._new_task_id``).  They are opaque for speech — a TTS
 # engine would read ``t_8b13866d`` as a jumble of letters and numbers.  The
 # spoken-id filter replaces each id with its human title: ``task "Foo bar"``.
-# Unresolvable ids are a hard error (the caller must fix the reference, not
-# ship garbled speech).  Replacement happens after markdown stripping so ids
-# inside fenced code blocks (which are removed, not spoken) do not trigger
-# lookups or errors, but before symbol normalisation so ``5/t_xxx`` style
-# digit-slash-letter sequences are not mis-expanded as rates (``5 per ...``).
-# Hermes skill is one-shot: every bare t_XXXXXXXX auto-resolves here to
-# ``task "Title"`` before synthesis — min quality is never reading the hex as
-# numbers.  In one-shot mode unspeakable content should surface as a
-# playwright direction ``(mumbles)`` via the instruction channel when available
-# (see speak_server.py leading ``(...)`` → voicedesign ``instruct``).
+# Prosody comes from surrounding punctuation (commas), not inline markup, so
+# the same script works on Kokoro (no instruct) and VoiceDesign (instruct
+# via leading ``(...)``).  Unresolvable ids are a hard error (the caller must
+# fix the reference, not ship garbled speech).  Replacement happens after
+# markdown stripping so ids inside fenced code blocks (which are removed,
+# not spoken) do not trigger lookups or errors, but before symbol
+# normalisation so ``5/t_xxx`` style digit-slash-letter sequences are not
+# mis-expanded as rates (``5 per ...``).  Hermes skill is one-shot: every
+# bare t_XXXXXXXX auto-resolves here to ``task "Title"`` before synthesis —
+# min quality is never reading the hex as numbers.  In one-shot mode
+# unspeakable content should surface as a playwright direction ``(mumbles)``
+# via the instruction channel when available (see speak_server.py leading
+# ``(...)`` → voicedesign ``instruct`` — same lane syndicate roleplay uses).
 _TASK_ID_RE = re.compile(r"\bt_[0-9a-f]{8}\b", flags=re.IGNORECASE)
 
 
@@ -336,10 +339,14 @@ def expand_task_ids_for_tts(text: str, *, strict: bool = True) -> str:
     (``\\b``-bounded), so surrounding digits/punctuation are preserved and
     the later ``normalize_symbols_for_tts`` pass never sees the raw hex as
     a numeric rate, date, or percentage.  The replacement itself is the
-    spoken form — ``task "Title"`` (quoted).  The normal symbol pass that
-    follows still expands any numbers/units *inside* the Title; one-shot
-    mode may also emit a leading ``(mumbles)`` direction for unspeakable
-    content via the instruction channel when available (hermes-voicedesign).
+    spoken form — ``task "Title"`` (quoted).  Prosody comes from
+    surrounding commas, not inline markup, so the same script works on
+    Kokoro and on VoiceDesign (which takes a leading ``(...)`` as
+    ``instruct`` — same lane as syndicate roleplay).  The normal symbol
+    pass that follows still expands any numbers/units *inside* the Title;
+    one-shot mode may also emit a leading ``(mumbles)`` direction for
+    unspeakable content via the instruction channel when available
+    (hermes-voicedesign).
     """
     if not text or "t_" not in text.lower():
         return text

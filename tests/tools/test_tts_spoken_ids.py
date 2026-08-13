@@ -22,7 +22,8 @@ class TestExpandTaskIds:
             "tools.tts_text_normalize._lookup_task_title", return_value="Do the thing"
         ):
             assert (
-                expand_task_ids_for_tts("see t_8b13866d now") == 'see task "Do the thing" now'
+                expand_task_ids_for_tts("see t_8b13866d now")
+                == 'see task "Do the thing" now'
             )
 
     def test_unresolvable_strict_raises(self):

@@ -12,6 +12,15 @@ This module provides:
 - hermes config set      - Set a specific value
 - hermes config unset    - Remove a user configuration value
 - hermes config wizard   - Re-run setup wizard
+
+File-safety opt-in:
+- ``file_safety.allow_write_default_home`` (bool, default ``False``) in
+  ``config.yaml`` — persistent opt-in for writes under the default profile's
+  home (``~/.hermes`` and any per-task sandbox-mirror homes).  Safe default is
+  off; see :func:`allow_write_default_home` and the matching logic in
+  ``agent/file_safety.py``.  The env var ``HERMES_ALLOW_WRITE_DEFAULT_HOME``
+  is the per-process alternative (see the file_safety module docstring).
+  The canonical flag is defined in ``hermes_cli/config_defaults.py``.
 """
 
 import copy
@@ -2881,6 +2890,73 @@ def is_provider_enabled(provider_cfg: Optional[Dict[str, Any]]) -> bool:
     if isinstance(flag, str):
         return flag.strip().lower() not in {"false", "0", "no", "off"}
     return bool(flag)
+
+
+# ---------------------------------------------------------------------------
+# file_safety: default/home write opt-in
+#
+# The default profile's home (``~/.hermes`` and any per-task sandbox-mirror
+# homes at ``…/sandboxes/<backend>/<task>/home``) is READONLY by default.
+# Reads are unaffected. Writes are denied unless the operator explicitly
+# opts in via either
+#
+#   * env  ``HERMES_ALLOW_WRITE_DEFAULT_HOME=1`` (per-process, for tests or a
+#     single recovery run), or
+#   * config ``file_safety.allow_write_default_home: true`` (persistent).
+#
+# This section is intentionally small: the flag definition lives in
+# ``hermes_cli/config_defaults.py`` (``file_safety.allow_write_default_home:
+# false``), and this module owns the accessor that ``agent/file_safety.py``
+# consults at write-denial time.  The actual enforcement wiring lives in
+# ``agent.file_safety`` — this task owns the flag definition and the accessor
+# only (see kanban t_a308c224).
+# ---------------------------------------------------------------------------
+
+_ALLOW_WRITE_DEFAULT_HOME_ENV = "HERMES_ALLOW_WRITE_DEFAULT_HOME"
+
+
+def allow_write_default_home(*, cfg: Optional[Dict[str, Any]] = None) -> bool:
+    """Return whether writes under the default profile's home are opted in.
+
+    Resolution order (first match wins):
+
+    1. ``HERMES_ALLOW_WRITE_DEFAULT_HOME`` env var — any truthy value (``1``,
+       ``true``, ``yes``, ``on``) enables it. This is the escape hatch for
+       tests and per-task recovery.
+    2. ``file_safety.allow_write_default_home`` in config — coerced via the
+       project's shared truthy set. An absent or missing config defaults to
+       ``False`` (writes denied — the safe default).
+
+    ``cfg`` may be passed explicitly by callers that already have a config dict
+    and want to avoid a second disk read; when ``None``, ``load_config_readonly``
+    is consulted. Any failure to read config is fail-closed (treated as not
+    opted in), matching ``agent.file_safety.default_home_writes_allowed``.
+    """
+    env = os.getenv(_ALLOW_WRITE_DEFAULT_HOME_ENV)
+    if env is not None:
+        try:
+            from utils import is_truthy_value  # local import to avoid cycles at import time
+
+            if is_truthy_value(env):
+                return True
+        except Exception:
+            if str(env).strip().lower() in {"1", "true", "yes", "on"}:
+                return True
+    try:
+        if cfg is None:
+            cfg = load_config_readonly() or {}
+        elif not isinstance(cfg, dict):
+            return False
+        section = cfg.get("file_safety")
+        # An absent section (not present in DEFAULT_CONFIG for an old config
+        # file, or a user removed it) is safe-default-false.
+        if not isinstance(section, dict):
+            return False
+        from utils import is_truthy_value  # local import — see above
+
+        return is_truthy_value(section.get("allow_write_default_home"), default=False)
+    except Exception:
+        return False
 
 
 def cfg_get(cfg: Optional[Dict[str, Any]], *keys: str, default: Any = None) -> Any:

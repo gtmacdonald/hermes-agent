@@ -503,6 +503,22 @@ DEFAULT_CONFIG = {
     # 100K chars ≈ 25–35K tokens across typical tokenisers.
     "file_read_max_chars": 100_000,
 
+    # File-safety posture — controls whether writes under the default profile's
+    # home (``~/.hermes``) are allowed. The default profile is the Hermes root
+    # itself, and non-local terminal backends additionally mirror a home at
+    # ``…/sandboxes/<backend>/<task>/home/``.  Both are READONLY by default:
+    # reads are unaffected, writes are denied unless this flag is explicitly
+    # set to ``true``.  Operators can also opt in per-process via the env var
+    # ``HERMES_ALLOW_WRITE_DEFAULT_HOME=1`` (see ``agent/file_safety.py``,
+    # which consults :func:`hermes_cli.config.allow_write_default_home`).
+    # Shared operational areas that merely live under the root but are not
+    # default-profile state (``profiles/``, ``kanban/``, ``workspaces/``, …)
+    # remain writable regardless of this flag.  Opt-in is intended for tests,
+    # migrations, and recovery only — not for routine agent work.
+    "file_safety": {
+        "allow_write_default_home": False,
+    },
+
     # Seconds to wait at agent-build time for in-flight MCP server discovery
     # to finish before the agent snapshots its tool list.  MCP discovery runs
     # in a background thread so a slow/dead server can't freeze startup; this
