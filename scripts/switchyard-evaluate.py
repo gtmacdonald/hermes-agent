@@ -73,13 +73,17 @@ USE_CASES = {
     "hermes-titles":     {"kind": "fixed", "prefer": ["kimi", "glimmer"]},
     "hermes-compaction": {"kind": "fixed", "prefer": ["kimi", "deepseek"]},
     # Effort tiers — names match hermes /reasoning levels 1:1 (Greg, 2026-08-13).
-    # Three cost bands; edit prefs as model vetting proceeds.
+    # Serving models must TOLERATE reasoning params (agent.reasoning_overrides
+    # pins one per tier): kimi and deepseek verified OK; haiku REJECTS every
+    # effort value via switchyard's anthropic translation ("adaptive thinking
+    # is not supported") — haiku is judge-only, never a serving target.
+    # Depth within the kimi band comes from the override, not the model.
     **{f"hermes-{lvl}": {"kind": "fixed", "prefer": prefs} for lvl, prefs in {
         "none":    ["kimi", "glimmer"],
         "minimal": ["kimi", "glimmer"],
         "low":     ["kimi", "glimmer"],
-        "medium":  ["haiku", "kimi"],
-        "high":    ["haiku", "deepseek"],
+        "medium":  ["kimi", "deepseek"],
+        "high":    ["deepseek", "spark"],
         "xhigh":   ["deepseek", "spark"],
         "max":     ["deepseek", "spark"],
         "ultra":   ["deepseek", "spark"],
