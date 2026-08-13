@@ -169,19 +169,28 @@ class CronPromptInjectionBlocked(Exception):
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
-    Four protected toolsets are always disabled in cron context:
-      - ``cronjob`` — would let a cron-spawned agent schedule more cron jobs
+    Three toolsets are always disabled in cron context regardless of config:
       - ``messaging`` — interactive, needs a live gateway session
       - ``clarify`` — interactive, blocks waiting for user input
       - ``memory`` — cron agents are constructed with ``skip_memory=True``, so
         exposing this tool only gives the model an unbacked tool that fails
+
+    ``cronjob`` is policy-denied by default (loop prevention, not a security
+    boundary) and config-gated: setting ``cron.allow_agent_scheduling: true``
+    in config.yaml drops it from the base denylist so cron-spawned agents may
+    manage the user's cron table. The gate only removes the built-in policy
+    denial — it never overrides the user denylist below.
 
     User-level ``agent.disabled_toolsets`` from config.yaml is layered on top
     so per-job ``enabled_toolsets`` cannot bypass policy that applies to
     ordinary agent runs (#25752 — LLM-supplied enabled_toolsets was widening
     past config.yaml's denylist).
     """
-    disabled = ["cronjob", "messaging", "clarify", "memory"]
+    cron_cfg = (cfg or {}).get("cron") or {}
+    if cron_cfg.get("allow_agent_scheduling"):
+        disabled = ["messaging", "clarify", "memory"]
+    else:
+        disabled = ["cronjob", "messaging", "clarify", "memory"]
     agent_cfg = (cfg or {}).get("agent") or {}
     user_disabled = agent_cfg.get("disabled_toolsets") or []
     for name in user_disabled:
@@ -1288,6 +1297,30 @@ def _iter_home_target_platforms():
         pass
 
 
+def _relay_fronted_delivery_platforms(connected: set) -> set:
+    """Logical platforms deliverable through a connected relay connector.
+
+    ``get_connected_platforms()`` only sees NATIVELY configured platforms.
+    On a relay-fronted deployment (relay in ``config.platforms``, the real
+    platform credential living in the connector) the fronted platforms are
+    absent from that set although fire-time routing delivers to them via
+    ``resolve_delivery_transport`` + ``RelayAdapter.fronts_platform``. This
+    keeps validation symmetric with routing by consulting the same
+    env-derived deploy stamp (``GATEWAY_RELAY_PLATFORMS``) the live
+    adapter's identity set is seeded from. No relay connected -> empty set,
+    so native topologies keep the strict credential check unchanged.
+    """
+    if "relay" not in connected:
+        return set()
+    try:
+        from gateway.relay import relay_fronted_platforms
+
+        return relay_fronted_platforms()
+    except Exception:
+        logger.debug("relay fronted-platform lookup failed", exc_info=True)
+        return set()
+
+
 def cron_delivery_targets() -> list[dict]:
     """Return the platforms a cron job can auto-deliver to.
 
@@ -1308,6 +1341,7 @@ def cron_delivery_targets() -> list[dict]:
 
         gateway_config = load_gateway_config()
         connected = {p.value for p in gateway_config.get_connected_platforms()}
+        connected |= _relay_fronted_delivery_platforms(connected)
     except Exception:
         logger.debug("cron_delivery_targets: gateway config unavailable", exc_info=True)
         connected = set()
@@ -1329,6 +1363,36 @@ def cron_delivery_targets() -> list[dict]:
     return targets
 
 
+def _origin_thread_is_stale(origin: dict) -> bool:
+    """True when a Slack origin's thread is a stale creation-turn artifact.
+
+    Relay-fronted Slack in thread-per-message mode stamps each top-level
+    message's own id as the session thread (a session KEY, not a durable
+    location). Jobs persisted before origin capture learned to drop that
+    stamp carry it as ``origin.thread_id`` forever. Heuristic that repairs
+    them at fire time without touching genuine threads: when the origin
+    chat IS the configured Slack home chat (the ``/sethome`` conversation),
+    a pinned origin thread is the creation-message artifact — the user's
+    delivery expectation for their home conversation is top-level (or the
+    home target's own configured thread). Non-home chats keep their
+    threads: a job deliberately created inside a working thread stays there.
+    """
+    if str(origin.get("platform") or "").lower() != "slack":
+        return False
+    if not origin.get("thread_id"):
+        return False
+    home_chat = _get_home_target_chat_id("slack")
+    return bool(home_chat) and str(origin.get("chat_id")) == str(home_chat)
+
+
+def _origin_delivery_thread(origin: dict):
+    """The thread a deliver=origin job should use, stale stamps dropped."""
+    if _origin_thread_is_stale(origin):
+        home_thread = _get_home_target_thread_id("slack")
+        return home_thread if home_thread else None
+    return origin.get("thread_id")
+
+
 def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[dict]:
     """Resolve one concrete auto-delivery target for a cron job."""
 
@@ -1342,7 +1406,7 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
             return {
                 "platform": origin["platform"],
                 "chat_id": str(origin["chat_id"]),
-                "thread_id": origin.get("thread_id"),
+                "thread_id": _origin_delivery_thread(origin),
             }
         # Origin missing (e.g. job created via API/script) — try each
         # platform's home channel as a fallback instead of silently dropping.
@@ -1389,6 +1453,7 @@ def _resolve_single_delivery_target(job: dict, deliver_value: str) -> Optional[d
             and str(origin.get("platform") or "").lower() == platform_key
             and str(origin.get("chat_id")) == str(chat_id)
             and origin.get("thread_id")
+            and not _origin_thread_is_stale(origin)
         ):
             thread_id = origin.get("thread_id")
 
@@ -3119,6 +3184,7 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
                 connected = {
                     p.value for p in gateway_config.get_connected_platforms()
                 }
+                connected |= _relay_fronted_delivery_platforms(connected)
             except Exception:
                 logger.debug(
                     "preflight: gateway config unavailable — skipping "

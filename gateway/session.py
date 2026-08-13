@@ -2824,6 +2824,11 @@ class SessionStore:
                     "origin_json": _origin_json,
                     "display_name": source.chat_name,
                     "parent_session_id": prev_session_id,
+                    "model_config": (
+                        {"_reset_from": prev_session_id}
+                        if prev_session_id
+                        else None
+                    ),
                 }
 
         if _needs_save:
@@ -3319,6 +3324,7 @@ class SessionStore:
                 "origin_json": _reset_origin_json,
                 "display_name": old_entry.display_name,
                 "parent_session_id": db_end_session_id,
+                "model_config": {"_reset_from": db_end_session_id},
             }
 
         if self._db and db_end_session_id:
