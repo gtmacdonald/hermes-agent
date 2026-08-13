@@ -56,7 +56,6 @@ MODELS = {
     "spark":    {"client": "meta", "id": "muse-spark-1.2"},
     "haiku":    {"client": "anthropic", "id": "claude-haiku-4-5-20251001"},
     "luna":     {"client": "openai", "id": "gpt-4o"},
-    "glimmer":  {"client": "local", "id": "unsloth/muse-glimmer-30b"},
     "qwen4b":   {"client": "local", "id": "qwen/qwen3-4b-2507"},  # Instruct-2507: never thinks, snappy, free
 }
 
