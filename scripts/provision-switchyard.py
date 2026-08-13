@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""provision-switchyard.py — probe what's live, regenerate USE-CASE routes.
+"""provision-switchyard.py — DEPRECATED (Greg, 2026-08-13).
+
+routes.toml is managed BY HAND now. This script is kept for reference and as
+a liveness probe (--dry-run still works); applying requires --force and will
+OVERWRITE manual edits to routes.toml. Prefer: edit routes.toml directly,
+validate with `switchyard-server --config routes.toml --dry-run`, then
+`launchctl kickstart -k gui/$UID/com.hermes.switchyard`.
+
+Original purpose — probe what's live, regenerate USE-CASE routes:
 
 Supersedes ensure-switchyard.py's route authoring. Design (Greg, 2026-08-13,
 revised same day): switchyard exists for AUTOMATIC DISPATCH ONLY. A static
@@ -201,6 +209,9 @@ def sync_provider_block(cfg_path: Path, dry: bool) -> str:
 
 def main() -> None:
     dry = "--dry-run" in sys.argv
+    if not dry and "--force" not in sys.argv:
+        sys.exit("DEPRECATED: routes.toml is hand-managed now. Use --dry-run to probe, "
+                 "or --force to overwrite manual edits (you probably don't want this).")
     env = load_env()
     print("── probing catalog ──")
     live = {}
