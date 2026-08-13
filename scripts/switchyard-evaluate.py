@@ -57,6 +57,7 @@ MODELS = {
     "haiku":    {"client": "anthropic", "id": "claude-haiku-4-5-20251001"},
     "luna":     {"client": "openai", "id": "gpt-4o"},
     "glimmer":  {"client": "local", "id": "unsloth/muse-glimmer-30b"},
+    "qwen4b":   {"client": "local", "id": "qwen/qwen3-4b-2507"},  # Instruct-2507: never thinks, snappy, free
 }
 
 # One route per hermes use case. Preference lists: first LIVE model wins.
@@ -65,12 +66,12 @@ USE_CASES = {
     "hermes-main": {
         "kind": "classifier",
         "judge": ["haiku", "luna"],          # capable arbitration until deepseek is vetted
-        "weak": ["kimi", "glimmer"],
+        "weak": ["kimi", "qwen4b"],
         "strong": ["deepseek", "spark"],
         "threshold": 0.5,
         "affinity": True,
     },
-    "hermes-titles":     {"kind": "fixed", "prefer": ["kimi", "glimmer"]},
+    "hermes-titles":     {"kind": "fixed", "prefer": ["qwen4b", "kimi"]},  # local-first (Greg, 2026-08-13)
     "hermes-compaction": {"kind": "fixed", "prefer": ["kimi", "deepseek"]},
     # Effort tiers — names match hermes /reasoning levels 1:1 (Greg, 2026-08-13).
     # Serving models must TOLERATE reasoning params (agent.reasoning_overrides
@@ -79,9 +80,9 @@ USE_CASES = {
     # is not supported") — haiku is judge-only, never a serving target.
     # Depth within the kimi band comes from the override, not the model.
     **{f"hermes-{lvl}": {"kind": "fixed", "prefer": prefs} for lvl, prefs in {
-        "none":    ["kimi", "glimmer"],
-        "minimal": ["kimi", "glimmer"],
-        "low":     ["kimi", "glimmer"],
+        "none":    ["kimi", "qwen4b"],
+        "minimal": ["kimi", "qwen4b"],
+        "low":     ["kimi", "qwen4b"],
         "medium":  ["kimi", "deepseek"],
         "high":    ["deepseek", "spark"],
         "xhigh":   ["deepseek", "spark"],
