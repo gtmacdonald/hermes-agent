@@ -1069,6 +1069,17 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        # Named OpenAI-compatible endpoint: stt.<name> with a base_url —
+        # a first-class label (e.g. "aurora") for a LAN speech server.
+        named = stt_config.get(provider) if isinstance(stt_config, dict) else None
+        if isinstance(named, dict) and named.get("base_url"):
+            if _HAS_OPENAI:
+                return provider
+            logger.warning(
+                "STT provider %r needs the 'openai' package", provider
+            )
+            return "none"
+
         if provider == "mistral":
             if _HAS_MISTRAL and _resolve_provider_key("MISTRAL_API_KEY", "mistral"):
                 return "mistral"
@@ -3050,6 +3061,18 @@ def _dispatch_stt_provider(
         model_name = model or openai_cfg.get("model", DEFAULT_STT_MODEL)
         return _transcribe_openai(
             file_path, model_name, language=language, prompt=prompt,
+        )
+
+    named_cfg = stt_config.get(provider) if isinstance(stt_config, dict) else None
+    if isinstance(named_cfg, dict) and named_cfg.get("base_url"):
+        model_name = model or named_cfg.get("model", DEFAULT_STT_MODEL)
+        return _transcribe_openai(
+            file_path, model_name,
+            api_key=named_cfg.get("api_key") or "not-needed",
+            base_url=named_cfg["base_url"],
+            provider_label=provider,
+            language=language or (named_cfg.get("language") or None),
+            prompt=prompt,
         )
 
     if provider == "mistral":

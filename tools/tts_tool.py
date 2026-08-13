@@ -768,6 +768,23 @@ def _resolve_minimax_tts_runtime(
 
 # Built-in provider names. Any ``tts.provider`` value NOT in this set is
 # interpreted as a reference to ``tts.providers.<name>``.
+def _named_openai_compatible_config(provider, tts_config):
+    """Config block for a named OpenAI-compatible endpoint, or None.
+
+    A provider name outside the built-ins whose ``tts.<name>`` block carries a
+    ``base_url`` is a first-class label for an OpenAI-compatible speech server
+    (e.g. ``aurora`` for a LAN speaches box) — the provider name then says what
+    it is instead of hiding behind ``openai``. Command providers (under
+    ``tts.providers.<name>``) are a different mechanism and take precedence.
+    """
+    if not isinstance(tts_config, dict) or provider in BUILTIN_TTS_PROVIDERS:
+        return None
+    block = tts_config.get(provider)
+    if isinstance(block, dict) and block.get("base_url"):
+        return block
+    return None
+
+
 BUILTIN_TTS_PROVIDERS = frozenset({
     "edge",
     "elevenlabs",
@@ -3335,6 +3352,25 @@ def _text_to_speech_single(
             logger.info("Generating speech with OpenAI TTS...")
             _generate_openai_tts(text, file_str, tts_config, instructions=instructions)
 
+        elif (named_cfg := _named_openai_compatible_config(provider, tts_config)) is not None:
+            try:
+                _import_openai_client()
+            except ImportError:
+                return json.dumps({
+                    "success": False,
+                    "error": f"TTS provider '{provider}' uses the 'openai' SDK but it isn't installed."
+                }, ensure_ascii=False)
+            logger.info("Generating speech with %s (OpenAI-compatible)...", provider)
+            _generate_openai_tts(
+                text, file_str, tts_config,
+                api_key=named_cfg.get("api_key") or "not-needed",
+                base_url=named_cfg["base_url"],
+                model=named_cfg.get("model"),
+                voice=named_cfg.get("voice"),
+                speed=named_cfg.get("speed"),
+                instructions=instructions,
+            )
+
         elif provider == "deepinfra":
             try:
                 _import_openai_client()
@@ -3809,6 +3845,8 @@ def check_tts_requirements() -> bool:
         if importlib.util.find_spec("openai") is None:
             return False
         return _has_openai_audio_backend()
+    if _named_openai_compatible_config(provider, tts_config) is not None:
+        return importlib.util.find_spec("openai") is not None
     if provider == "deepinfra":
         if importlib.util.find_spec("openai") is None:
             return False
