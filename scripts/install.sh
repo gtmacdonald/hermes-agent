@@ -2400,6 +2400,40 @@ install_node_deps() {
     restore_dirty_lockfiles "$INSTALL_DIR"
 }
 
+install_browser_use_cli() {
+    # The Browser Use CLI is the default browser backend when it is runnable
+    # (tools/browser_use_cli.py). Provision it here so fresh installs don't
+    # silently fall back to the built-in browser tools. Best-effort: any
+    # failure is non-fatal because browser_exec can still run via uvx and
+    # `hermes tools` can install it later.
+    if [ "$SKIP_BROWSER" = true ]; then
+        log_info "Skipping Browser Use CLI install (--skip-browser)"
+        return 0
+    fi
+    if [ "$DISTRO" = "termux" ]; then
+        return 0
+    fi
+    if [ -z "$UV_CMD" ]; then
+        log_info "Skipping Browser Use CLI install (uv unavailable)"
+        return 0
+    fi
+    if command -v browser-use >/dev/null 2>&1 || [ -x "$HERMES_HOME/bin/browser-use" ]; then
+        log_success "Browser Use CLI already installed"
+        return 0
+    fi
+
+    log_info "Installing Browser Use CLI (default browser backend)..."
+    # UV_TOOL_BIN_DIR keeps the binary inside Hermes' managed bin dir, where
+    # the browser tool resolves it — no reliance on the user's PATH.
+    if run_with_timeout 600 env UV_NO_CONFIG=1 UV_TOOL_BIN_DIR="$HERMES_HOME/bin" \
+        "$UV_CMD" tool install browser-use >/dev/null 2>&1; then
+        log_success "Browser Use CLI installed"
+    else
+        log_warn "Browser Use CLI install failed — browser automation falls back to built-in tools."
+        log_info "Install later with: $UV_CMD tool install browser-use  (or via 'hermes tools')"
+    fi
+}
+
 run_setup_wizard() {
     if [ "$RUN_SETUP" = false ]; then
         log_info "Skipping setup wizard (--skip-setup)"
@@ -2672,13 +2706,20 @@ ensure_browser() {
         return 1
     fi
 
-    log_info "Installing agent-browser..."
+    # agent-browser itself is intentionally NOT installed here (#43564 /
+    # PR #44772 review): it resolves lazily via `npx agent-browser` instead,
+    # which every consumer (tools/browser_tool.py, `hermes update`'s npx
+    # cache warm) already goes through. Eagerly npm-installing a second,
+    # separately version-pinned copy here -- only reachable via this
+    # explicit --ensure browser fallback in the first place -- was redundant
+    # complexity and an extra credential/supply-chain surface for a path
+    # npx already covers.
+    log_info "Installing camofox browser server..."
     local log_file
     log_file="$(mktemp)"
     # Time-boxed (#39219): a stalled npm registry fetch here would otherwise
     # hang the installer with no progress, same class as the desktop build.
     if ! run_with_timeout "$NODE_DEPS_TIMEOUT" "$npm_bin" install -g --prefix "$HERMES_HOME/node" --silent --ignore-scripts \
-        "agent-browser@^0.26.0" \
         "@askjo/camofox-browser@^1.5.2" \
         >"$log_file" 2>&1; then
         log_error "npm install failed or timed out:"
@@ -2694,31 +2735,7 @@ ensure_browser() {
     sys_browser="$(find_system_browser 2>/dev/null || true)"
     if [ -n "$sys_browser" ]; then
         configure_browser_env_from_system_browser "$sys_browser"
-        log_info "Explicit browser override set -- skipping bundled Chromium download"
-        return 0
-    fi
-
-    log_info "Installing Chromium via agent-browser install..."
-    local ab_bin="$HERMES_HOME/node/bin/agent-browser"
-    if [ -x "$ab_bin" ]; then
-        "$ab_bin" install 2>/dev/null || {
-            log_warn "Chromium install failed. Browser tools may not work without a system browser."
-
-            # OS-specific hints (detect_os sets $DISTRO)
-            case "${DISTRO:-unknown}" in
-                ubuntu|debian)
-                    log_info "Try: sudo apt-get install -y chromium-browser"
-                    ;;
-                arch)
-                    log_info "Try: sudo pacman -S chromium"
-                    ;;
-                fedora|rhel|centos)
-                    log_info "Try: sudo dnf install -y chromium"
-                    ;;
-            esac
-        }
-    else
-        log_warn "agent-browser not found at $ab_bin"
+        log_info "Explicit browser override set -- Chromium download will be skipped when agent-browser installs on demand"
     fi
 
     return 0
@@ -3222,6 +3239,8 @@ run_stage_body() {
             require_install_dir
             check_node
             install_node_deps
+            install_uv
+            install_browser_use_cli
             ;;
         path)
             detect_os
@@ -3337,6 +3356,7 @@ main() {
     setup_venv
     install_deps
     install_node_deps
+    install_browser_use_cli
     setup_path
     copy_config_templates
     run_setup_wizard

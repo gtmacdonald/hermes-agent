@@ -494,6 +494,7 @@ def init_agent(
     read_terminal_callback: callable = None,
     read_preview_callback: callable = None,
     read_window_below_callback: callable = None,
+    setup_mcp_callback: callable = None,
     step_callback: callable = None,
     stream_delta_callback: callable = None,
     interim_assistant_callback: callable = None,
@@ -769,6 +770,7 @@ def init_agent(
     agent.read_terminal_callback = read_terminal_callback
     agent.read_preview_callback = read_preview_callback
     agent.read_window_below_callback = read_window_below_callback
+    agent.setup_mcp_callback = setup_mcp_callback
     agent.step_callback = step_callback
     agent.stream_delta_callback = stream_delta_callback
     agent.interim_assistant_callback = interim_assistant_callback
@@ -829,7 +831,17 @@ def init_agent(
     agent._delegate_depth = 0        # 0 = top-level agent, incremented for children
     agent._active_children = []      # Running child AIAgents (for interrupt propagation)
     agent._active_children_lock = threading.Lock()
-    
+
+    # Background memory/skill review state (agent/background_review.py). Holds
+    # the forked review AIAgent while its run_conversation() is in flight, so
+    # the NEXT live turn can proactively interrupt a still-running review
+    # instead of letting the two race concurrently against the same
+    # session_id/credentials (observed as doubled prompt-token counts and a
+    # Ctrl+C-proof lockup when a live turn started before a review fired at
+    # the end of the prior turn had finished).
+    agent._background_review_agent = None
+    agent._background_review_lock = threading.Lock()
+
     # Store OpenRouter provider preferences
     agent.providers_allowed = providers_allowed
     agent.providers_ignored = providers_ignored
@@ -1430,6 +1442,16 @@ def init_agent(
         else:
             print(f"🔄 Fallback chain ({len(agent._fallback_chain)} providers): " +
                   " → ".join(f"{f['model']} ({f['provider']})" for f in agent._fallback_chain))
+
+    # A multiplexed gateway may enter a different HERMES_HOME after
+    # ``model_tools`` was first imported. Ensure that profile's keyed plugin
+    # manager has discovered its registrations before taking the tool snapshot.
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception:
+        logger.warning("Plugin discovery failed during agent setup", exc_info=True)
 
     # Get available tools with filtering. Capture the registry generation this
     # snapshot is derived from FIRST, so a later concurrent refresh can tell
@@ -2080,6 +2102,27 @@ def init_agent(
             codex_app_server_auto_compaction,
         )
         codex_app_server_auto_compaction = "native"
+    # Native OpenAI Responses server-side compaction (opt-in). Only ever
+    # engages for gpt-5.6-family models on api.openai.com or the ChatGPT
+    # Codex backend — the per-request gate lives in agent/native_compaction.py.
+    codex_responses_native_compaction = bool(
+        _compression_cfg.get("codex_responses_native", False)
+    )
+    _native_threshold_raw = _compression_cfg.get(
+        "codex_responses_compact_threshold", 200_000
+    )
+    try:
+        if isinstance(_native_threshold_raw, bool):
+            raise ValueError
+        codex_responses_compact_threshold = int(_native_threshold_raw)
+        if codex_responses_compact_threshold <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        _ra().logger.warning(
+            "Invalid compression.codex_responses_compact_threshold=%r; using 200000.",
+            _native_threshold_raw,
+        )
+        codex_responses_compact_threshold = 200_000
     # Opt-in idle compaction: compact a session up front when it resumes after
     # this many seconds of inactivity (0 = disabled). Time-based, so it
     # complements the size-based threshold above. Consumed by build_turn_context().
@@ -2536,6 +2579,8 @@ def init_agent(
             compression_micro_compact_defrag_tokens
         )
     agent.codex_app_server_auto_compaction = codex_app_server_auto_compaction
+    agent.codex_responses_native_compaction = codex_responses_native_compaction
+    agent.codex_responses_compact_threshold = codex_responses_compact_threshold
     agent.max_compression_attempts = compression_max_attempts
     agent.compression_idle_compact_after_seconds = (
         compression_idle_compact_after_seconds

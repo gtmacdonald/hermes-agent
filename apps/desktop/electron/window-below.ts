@@ -4,12 +4,15 @@
 // `window.read.request` from the gateway, asks main over IPC, and answers
 // with this module's serialized result. Enumeration uses `get-windows`
 // (front-to-back z-order on macOS/Windows/Linux-X11); the picking logic is a
-// pure function so the OS-specific part stays a thin provider.
+// pure function so the OS-specific part stays a thin provider. Where that
+// provider can't run at all, the answer is why — see `enumerationFailureNote`.
 //
 // Privacy contract (matches the tool schema): metadata only — app, title,
 // bounds. Never pixels. On macOS, window titles require the Screen Recording
 // permission; we pass titles through only when that permission is ALREADY
 // granted and never trigger the prompt for it.
+
+import { readHyprlandWindows } from './hyprland'
 
 export interface EnumeratedWindow {
   app: string
@@ -31,10 +34,57 @@ export interface WindowBelowResult {
   } | null
 }
 
-const overlaps = (
-  a: EnumeratedWindow['bounds'],
-  b: EnumeratedWindow['bounds']
-): boolean =>
+export interface WindowBelowUnavailable {
+  error: string
+  platform: string
+}
+
+/**
+ * Why enumeration just failed, in terms the user can act on.
+ *
+ * The generic "could not determine the window underneath" this replaces is a
+ * dead end on Linux, where the two ways it fails have opposite fixes and
+ * neither is guessable: a Wayland session withholds window identity from
+ * applications outright, and an X11 session needs `xprop`/`xwininfo` present
+ * because that is what the enumerator shells out to.
+ *
+ * A session with both `WAYLAND_DISPLAY` and `DISPLAY` is Wayland running
+ * XWayland, where `xprop` can still answer — so it is treated as X11 and gets
+ * the tooling advice rather than being told to change session type.
+ */
+export function enumerationFailureNote(platform: string, env: NodeJS.ProcessEnv): string {
+  if (platform !== 'linux') {
+    return 'Could not enumerate windows on this system.'
+  }
+
+  // Hyprland is asked over its own IPC, so reaching here means the socket
+  // didn't answer — telling a Hyprland user to go and install xprop, or to
+  // abandon Wayland, would send them in exactly the wrong direction.
+  if (env.HYPRLAND_INSTANCE_SIGNATURE) {
+    return (
+      'Could not enumerate windows: Hyprland did not answer on its IPC socket. ' +
+      'Check that `hyprctl clients` works from the same session Hermes is ' +
+      'running in.'
+    )
+  }
+
+  const wayland = env.XDG_SESSION_TYPE === 'wayland' || (Boolean(env.WAYLAND_DISPLAY) && !env.DISPLAY)
+
+  if (wayland) {
+    return (
+      'Could not enumerate windows: this is a Wayland session, and Wayland does ' +
+      'not let an application see other applications\u2019 windows. Log in to an ' +
+      'X11/Xorg session, or run Hermes under XWayland with DISPLAY set.'
+    )
+  }
+
+  return (
+    'Could not enumerate windows: this needs the xprop and xwininfo commands ' +
+    '(the x11-utils package on Debian/Ubuntu, xorg-x11-utils on Fedora).'
+  )
+}
+
+const overlaps = (a: EnumeratedWindow['bounds'], b: EnumeratedWindow['bounds']): boolean =>
   a.x < b.x + b.width && b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height
 
 /**
@@ -62,10 +112,7 @@ export function pickWindowBelow(
 }
 
 type GetWindowsModule = {
-  openWindows: (options?: {
-    accessibilityPermission?: boolean
-    screenRecordingPermission?: boolean
-  }) => Promise<
+  openWindows: (options?: { accessibilityPermission?: boolean; screenRecordingPermission?: boolean }) => Promise<
     Array<{
       bounds?: { height?: number; width?: number; x?: number; y?: number }
       id?: number
@@ -87,15 +134,12 @@ const loadGetWindows = (): Promise<GetWindowsModule> => {
  * Enumerate windows and serialize the one underneath `selfBounds`.
  *
  * `titlesAvailable` is the macOS Screen Recording grant (pass true on other
- * platforms, where titles are free). Returns null only when enumeration
- * itself is unavailable (Wayland, missing xprop, addon load failure) — the
- * caller turns that into an empty tool answer.
+ * platforms, where titles are free). When enumeration itself is unavailable
+ * (Wayland, missing xprop, addon load failure) this answers with the reason
+ * rather than nothing, so the agent can tell the user what to fix instead of
+ * reporting a blank failure.
  */
-export async function readWindowBelow(
-  selfPid: number,
-  selfBounds: EnumeratedWindow['bounds'],
-  titlesAvailable: boolean
-): Promise<WindowBelowResult | null> {
+async function enumerateViaGetWindows(titlesAvailable: boolean): Promise<EnumeratedWindow[] | null> {
   let raw
 
   try {
@@ -120,7 +164,7 @@ export async function readWindowBelow(
   // must be reversed to match. (Verified against get-windows 9.3.0.)
   const ordered = process.platform === 'linux' ? [...raw].reverse() : raw
 
-  const windows: EnumeratedWindow[] = ordered.map(w => ({
+  return ordered.map(w => ({
     app: w.owner?.name ?? '',
     bounds: {
       x: w.bounds?.x ?? 0,
@@ -132,15 +176,31 @@ export async function readWindowBelow(
     pid: w.owner?.processId ?? 0,
     title: w.title ?? ''
   }))
+}
+
+export async function readWindowBelow(
+  selfPid: number,
+  selfBounds: EnumeratedWindow['bounds'],
+  titlesAvailable: boolean
+): Promise<WindowBelowResult | WindowBelowUnavailable> {
+  // Hyprland first, and only ever on Hyprland — its own IPC sees native Wayland
+  // windows, which the X11 enumerator below cannot, and it answers null
+  // everywhere else so the established path stays the default.
+  const windows = (await readHyprlandWindows(selfPid)) ?? (await enumerateViaGetWindows(titlesAvailable))
+
+  if (!windows) {
+    return {
+      error: enumerationFailureNote(process.platform, process.env),
+      platform: process.platform
+    }
+  }
 
   const { below, frontmost } = pickWindowBelow(windows, selfPid, selfBounds)
 
   const result: WindowBelowResult = {
     frontmost: frontmost ? { app: frontmost.app, title: frontmost.title } : null,
     platform: process.platform,
-    window: below
-      ? { app: below.app, bounds: below.bounds, id: below.id, title: below.title }
-      : null
+    window: below ? { app: below.app, bounds: below.bounds, id: below.id, title: below.title } : null
   }
 
   if (process.platform === 'darwin' && !titlesAvailable) {
