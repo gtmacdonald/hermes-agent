@@ -911,6 +911,11 @@ def _speak_text_streaming(text: str, stop_event: Optional[threading.Event] = Non
         stop_event = _threading.Event()
     done_event = _threading.Event()
     stream_tts_to_speaker(text_queue, stop_event, done_event)
+    # Wait for the streaming pipeline to finish (up to 5 minutes for long replies)
+    # before returning. The pipeline sets done_event in its finally block after
+    # all audio playback is complete. Without this wait, we'd return too early
+    # and speak_text would fall through to the sync path, causing double playback.
+    done_event.wait(timeout=300.0)
     return done_event.is_set()
 
 
