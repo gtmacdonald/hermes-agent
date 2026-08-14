@@ -7759,166 +7759,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         else:
             self._console_print(f"[dim]{_escape(msg)}[/dim]")
 
-    # ────────────────────────────────────────────────────────────────
-    # /project — mid-session project/cwd switch + optional topic label
-    # ────────────────────────────────────────────────────────────────
-
-    def _handle_project_command(self, cmd_original: str) -> None:
-        """Switch the working directory mid-session and optionally set a topic.
-
-        Usage:
-            /project <path>              — switch to <path>
-            /project <path> topic: <label> — switch and label the topic
-            /project                     — show current project + topic
-
-        Changes the process cwd (``os.chdir``) and ``TERMINAL_CWD`` so all
-        tools land in the new directory, then queues a one-shot note
-        (``_pending_project_note``) that gets prepended to the next user
-        message — telling the model the project/cwd and/or topic changed,
-        without rewriting the system prompt (which would break the prefix
-        cache). Same pattern as ``_pending_model_switch_note``.
-        """
-        from agent.project import (
-            PENDING_NOTE_ATTR,
-            PENDING_TOPIC_ATTR,
-            apply_project_change,
-            get_project_topic,
-        )
-
-        # Parse: /project <path> [topic: <label>]
-        parts = cmd_original.split(None, 1)
-        args = parts[1].strip() if len(parts) > 1 else ""
-
-        if not args:
-            # Show current state
-            try:
-                cwd = os.getcwd()
-            except OSError:
-                cwd = os.getenv("TERMINAL_CWD", "?")
-            topic = get_project_topic(self)
-            _cprint(f"  📁 Project: {cwd}")
-            if topic:
-                _cprint(f"  🏷️  Topic: {topic}")
-            _cprint("  Usage: /project <path> [topic: <label>]")
-            return
-
-        # Extract optional "topic: <label>" suffix
-        topic = None
-        path_arg = args
-        # Case-insensitive "topic:" prefix detection for the trailing segment
-        lower = args.lower()
-        topic_marker = " topic: "
-        idx = lower.rfind(topic_marker)
-        if idx < 0:
-            # Also handle "topic:" without space before it (e.g. "path topic:foo")
-            topic_marker = " topic:"
-            idx = lower.rfind(topic_marker)
-        if idx >= 0:
-            # Check it's at a word boundary (preceded by space or start)
-            prefix_end = idx
-            if prefix_end > 0 and not args[prefix_end - 1].isspace():
-                # Not a real "topic:" — treat the whole thing as a path
-                pass
-            else:
-                path_arg = args[:idx].strip()
-                topic = args[idx + len(topic_marker):].strip()
-                if not topic:
-                    _cprint("  ⚠ Topic label is empty after 'topic:'.")
-                    return
-
-        if not path_arg:
-            _cprint("  ⚠ Path required. Usage: /project <path> [topic: <label>]")
-            return
-
-        old_topic = get_project_topic(self) or None
-        try:
-            note = apply_project_change(
-                path_arg,
-                topic=topic,
-                old_topic=old_topic,
-                session_key=self.session_id or "",
-            )
-        except ValueError as exc:
-            _cprint(f"  ⚠ {exc}")
-            return
-
-        # Store topic label on the CLI instance
-        if topic is not None:
-            setattr(self, PENDING_TOPIC_ATTR, topic)
-
-        # Queue the one-shot note for the next user turn
-        setattr(self, PENDING_NOTE_ATTR, note)
-
-        try:
-            new_cwd = os.getcwd()
-        except OSError:
-            new_cwd = path_arg
-        _cprint(f"  ✓ Project switched: {new_cwd}")
-        if topic:
-            _cprint(f"    Topic: {topic}")
-
-    def _handle_topic_set_command(self, cmd_original: str) -> None:
-        """Set or clear a topic label for the current project.
-
-        Usage:
-            /topic-set <label>   — set the topic label
-            /topic-set clear     — clear the topic label
-            /topic-set           — show current topic
-
-        The topic label is a human-readable annotation for the current
-        project context. It gets included in the note that tells the model
-        the project context changed (via ``/project``), and can be set
-        independently here.
-        """
-        from agent.project import PENDING_NOTE_ATTR, PENDING_TOPIC_ATTR, build_project_note
-
-        parts = cmd_original.split(None, 1)
-        arg = parts[1].strip() if len(parts) > 1 else ""
-
-        old_topic = getattr(self, PENDING_TOPIC_ATTR, None) or None
-
-        if not arg:
-            if old_topic:
-                _cprint(f"  🏷️  Topic: {old_topic}")
-            else:
-                _cprint("  No topic set. Usage: /topic-set <label> | clear")
-            return
-
-        if arg.lower() == "clear":
-            if not old_topic:
-                _cprint("  No topic to clear.")
-                return
-            setattr(self, PENDING_TOPIC_ATTR, None)
-            # Queue a note so the model knows the topic cleared
-            try:
-                cwd = os.getcwd()
-            except OSError:
-                cwd = os.getenv("TERMINAL_CWD", "")
-            note = build_project_note(
-                old_cwd=cwd,
-                new_cwd=cwd,
-                old_topic=old_topic,
-                new_topic=None,
-            )
-            setattr(self, PENDING_NOTE_ATTR, note)
-            _cprint("  ✓ Topic cleared.")
-            return
-
-        setattr(self, PENDING_TOPIC_ATTR, arg)
-        # Queue a note so the model knows the topic was set
-        try:
-            cwd = os.getcwd()
-        except OSError:
-            cwd = os.getenv("TERMINAL_CWD", "")
-        note = build_project_note(
-            old_cwd=cwd,
-            new_cwd=cwd,
-            old_topic=old_topic,
-            new_topic=arg,
-        )
-        setattr(self, PENDING_NOTE_ATTR, note)
-        _cprint(f"  ✓ Topic set: {arg}")
-
     def _restore_session_yolo(self, session_meta: dict, *, quiet: bool = False) -> None:
         """Re-enable YOLO bypass on resume when the session had it on.
 
@@ -10888,10 +10728,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self.new_session(title=title)
         elif canonical == "resume":
             self._handle_resume_command(cmd_original)
-        elif canonical == "project":
-            self._handle_project_command(cmd_original)
-        elif canonical == "topic-set":
-            self._handle_topic_set_command(cmd_original)
         elif canonical == "sessions":
             self._handle_sessions_command(cmd_original)
         elif canonical == "model":
@@ -14899,14 +14735,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 if _srn:
                     agent_message = _prepend_note_to_message(agent_message, _srn)
                     self._pending_skills_reload_note = None
-                # Prepend pending /project or /topic-set note so the model knows
-                # the cwd/project and/or topic label changed. Same one-shot
-                # queue pattern as the model-switch note above.
-                from agent.project import PENDING_NOTE_ATTR as _PROJECT_NOTE_ATTR
-                _prn = getattr(self, _PROJECT_NOTE_ATTR, None)
-                if _prn:
-                    agent_message = _prepend_note_to_message(agent_message, _prn)
-                    setattr(self, _PROJECT_NOTE_ATTR, None)
                 # Barged mid-speech (VAD or record key)? Tell the model it was
                 # cut off — same one-shot, API-local note channel as above.
                 from tools.tts_streaming import SPEECH_INTERRUPTED_NOTE, take_speech_interrupted

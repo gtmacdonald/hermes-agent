@@ -2593,9 +2593,6 @@ _CONVERSATION_SCOPED_STATE: tuple = (
     # and run_sync) must not leak into a future conversation's first user
     # message — session keys are source-derived and REUSED.
     "_pending_turn_sidecar_notes",
-    # Per-session topic labels set by /topic-set; cleared on /new so a fresh
-    # conversation starts topic-free.
-    "_pending_project_topics",
 )
 
 # Sentinel for "caller did not pass metadata" vs "caller passed None".
@@ -16458,12 +16455,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "resume":
             return await self._handle_resume_command(event)
-
-        if canonical == "project":
-            return await self._handle_project_command(event)
-
-        if canonical == "topic-set":
-            return await self._handle_topic_set_command(event)
 
         if canonical == "sessions":
             return await self._handle_sessions_command(event)

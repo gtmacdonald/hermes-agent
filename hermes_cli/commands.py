@@ -188,12 +188,6 @@ COMMAND_REGISTRY: list[CommandDef] = [
                gateway_only=True, aliases=("set-home",)),
     CommandDef("resume", "Resume a previously-named session", "Session",
                args_hint="[name]"),
-    CommandDef("project", "Switch project/cwd mid-session, optionally with a topic label", "Session",
-               aliases=("cd",), args_hint="[path] [topic: <label>]",
-               busy_policy="dispatch"),
-    CommandDef("topic-set", "Set or clear a topic label for the current project", "Session",
-               args_hint="[label | clear]",
-               busy_policy="dispatch"),
 
     # Configuration
     CommandDef("sessions", "Browse and resume previous sessions", "Session"),

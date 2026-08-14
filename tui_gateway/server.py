@@ -10019,18 +10019,6 @@ def _run_prompt_submit(
             # state, so it cannot live in the (byte-stable) system prompt.
             run_message = _prepend_note(run_message, _hud_surface_note(session))
 
-            # Project/topic change note from /project or /topic-set — same
-            # API-local enrichment channel as the reaction note above. Tells
-            # the model the cwd/project and/or topic label changed without
-            # rewriting the system prompt (which would break the prefix
-            # cache). One-shot: cleared on read.
-            from agent.project import PENDING_NOTE_ATTR as _PROJECT_NOTE_ATTR
-            _project_note = session.pop(_PROJECT_NOTE_ATTR, "") if isinstance(session, dict) else ""
-            if _project_note:
-                if isinstance(run_message, str):
-                    run_message = f"{_project_note}\n\n{run_message}"
-                elif isinstance(run_message, list):
-                    run_message = [{"type": "text", "text": _project_note}, *run_message]
 
             def _stream(delta):
                 with session["history_lock"]:
