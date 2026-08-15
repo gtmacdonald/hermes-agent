@@ -62,6 +62,117 @@ def _profile_has_kanban_toolset() -> bool:
         return False
 
 
+def _active_profile_name() -> Optional[str]:
+    """Best-effort active Hermes profile name.
+
+    Returns ``"default"`` when no profile is selected (the canonical
+    Hermes root), the named profile (``"<name>"``) when running under
+    ``hermes -p <name>``, or ``None`` on resolution failure so callers
+    fall back to the conservative deny path.
+    """
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name()
+    except Exception:
+        return None
+
+
+def _is_default_profile() -> bool:
+    """True when the active profile is Hermes' cross-profile orchestrator.
+
+    The default profile is the canonical cross-profile coordinator
+    (see ``DEFAULT_PROFILE_ORCHESTRATOR_GUIDANCE`` in
+    ``agent/prompt_builder.py``) — it routes work across every board
+    on this installation (``syndicate``, ``hermes-local-fork``,
+    ``default``, plus any future board) without per-board ACL entries.
+    Non-default profiles keep their profile-scoped board restrictions
+    and continue to honor the dispatcher-set ``HERMES_KANBAN_BOARD``
+    pin.
+
+    Mirrors the post-t_4281c05c posture in ``agent/file_safety.py``:
+    pairing the cross-board read/write carve-out for kanban DB paths
+    (``_is_kanban_allowlisted``) with the orchestrator-level ACL bypass
+    here keeps a single default-profile install functional while every
+    named profile keeps its existing isolation contract.
+    """
+    return _active_profile_name() == "default"
+
+
+def _enforce_board_acl(
+    board: Optional[str],
+    *,
+    tool_name: str,
+    operation: str,
+) -> Optional[str]:
+    """Gate ``board=...`` arg on the active profile's per-board ACL.
+
+    The dispatcher pins every spawned worker to one board via
+    ``HERMES_KANBAN_BOARD``, so worker-driven calls must keep their
+    scope. Orchestrator profiles (kanban toolset enabled, NOT scoped
+    to a single task) can also target a specific board per call to
+    route cross-board queries without restarting Hermes — the test in
+    ``tests/tools/test_kanban_tools.py::test_board_param_none_falls_back_to_env``
+    pins that contract.
+
+    The default profile is Hermes' cross-profile coordinator (see
+    ``_is_default_profile``) and is allowed to operate on ANY board
+    on this installation without per-board ACL entries. Non-default
+    profiles keep their existing profile-scoped board restrictions —
+    they may only address the env-pinned board; anything else is a
+    misrouted call.
+
+    Returns ``None`` when the call is allowed, or a ``tool_error``-
+    compatible string when it must be rejected.
+
+    This pairs with the kanban-path write carve-out in
+    ``agent/file_safety.py`` (``_is_kanban_allowlisted`` /
+    ``classify_default_home_write``): that carve-out lets the
+    default-profile write tools reach kanban DB files under the
+    otherwise-readonly ``~/`` and ``~/.hermes`` trees; the ACL bypass
+    here lets those same calls target any board regardless of the
+    env-pinned default. Both halves are required for the orchestrator
+    posture documented in ``agent/prompt_builder.py``.
+    """
+    # No explicit override — honour the env-pinned board. This is the
+    # legacy behaviour for every profile and is the dominant call shape.
+    if not board:
+        return None
+    # Dispatcher-spawned workers are pinned to one board via env; they
+    # MUST NOT route around it. A bug or prompt-injected ``board=``
+    # arg on a worker would silently cross tenants.
+    if os.environ.get("HERMES_KANBAN_TASK") and _is_dispatcher_owned_worker():
+        return tool_error(
+            f"{tool_name} {operation}: workers are pinned to one board "
+            f"(HERMES_KANBAN_BOARD); cross-board calls are orchestrator-only. "
+            f"Return findings to the parent agent instead of routing a "
+            f"foreign board's data into this worker's task."
+        )
+    # Default profile is the cross-profile orchestrator — bypass the
+    # per-board ACL entirely. The check is explicit (NOT a deletion of
+    # ACL for everyone) so non-default profiles still get the old
+    # "you can only touch the env-pinned board" posture.
+    if _is_default_profile():
+        return None
+    # Non-default orchestrator profiles (techlead-style) keep their
+    # existing profile-scoped board restrictions. The board arg must
+    # match whatever the env resolves to — explicit cross-board is
+    # rejected with a structured error the model can react to.
+    try:
+        from hermes_cli.kanban_db import get_current_board
+        pinned = get_current_board()
+    except Exception:
+        pinned = None
+    if pinned and board != pinned:
+        return tool_error(
+            f"{tool_name} {operation}: profile is pinned to board "
+            f"{pinned!r}; cross-board access from a non-default profile "
+            f"is denied. Use the env-pinned board (drop the ``board`` "
+            f"arg) or run from the default profile, which is the "
+            f"designated cross-profile orchestrator."
+        )
+    return None
+
+
 def _is_delegated_child_context() -> bool:
     try:
         from agent.delegation_context import is_delegated_child_context
@@ -523,6 +634,9 @@ def _handle_show(args: dict, **kw) -> str:
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_show", operation="read")
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -614,6 +728,9 @@ def _handle_list(args: dict, **kw) -> str:
     if limit > KANBAN_LIST_MAX_LIMIT:
         return tool_error(f"limit must be <= {KANBAN_LIST_MAX_LIMIT}")
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_list", operation="list")
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -743,6 +860,9 @@ def _handle_complete(args: dict, **kw) -> str:
         )
     metadata = _stamp_worker_session_metadata(tid, metadata)
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_complete", operation="complete")
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -833,6 +953,9 @@ def _handle_block(args: dict, **kw) -> str:
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_block", operation="block")
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         if kind is not None and kind not in kb.VALID_BLOCK_KINDS:
@@ -933,6 +1056,9 @@ def _handle_request_review(args: dict, **kw) -> str:
         # redact like summary / kanban_block's reason.
         reviewer = redact_sensitive_text(str(reviewer), force=True)
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_request_review", operation="request_review")
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -991,6 +1117,9 @@ def _handle_request_changes(args: dict, **kw) -> str:
         return tool_error("reason is required — describe the changes needed")
     reason = redact_sensitive_text(str(reason), force=True)
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_request_changes", operation="request_changes")
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1044,6 +1173,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
         return ownership_err
     note = args.get("note")
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_heartbeat", operation="heartbeat")
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1101,6 +1233,9 @@ def _handle_comment(args: dict, **kw) -> str:
     # comments are the deliberate handoff channel between tasks.
     author = os.environ.get("HERMES_PROFILE") or "worker"
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_comment", operation="comment")
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1150,6 +1285,9 @@ def _handle_attach(args: dict, **kw) -> str:
         return tool_error(f"content_base64 is not valid base64: {e}")
     content_type = args.get("content_type")
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_attach", operation="attach")
+    if board_err:
+        return board_err
     try:
         _, conn = _connect(board=board)
         try:
@@ -1270,6 +1408,9 @@ def _handle_attach_url(args: dict, **kw) -> str:
         filename = leaf or "download"
     content_type = args.get("content_type")
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_attach_url", operation="attach_url")
+    if board_err:
+        return board_err
     try:
         data, fetched_ct = _download_url_with_cap(url, kb.KANBAN_ATTACHMENT_MAX_BYTES)
     except ValueError as e:
@@ -1309,6 +1450,9 @@ def _handle_attachments(args: dict, **kw) -> str:
             "task_id is required (or set HERMES_KANBAN_TASK in the env)"
         )
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_attachments", operation="list_attachments")
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1420,6 +1564,9 @@ def _handle_create(args: dict, **kw) -> str:
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_create", operation="create")
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1624,6 +1771,9 @@ def _handle_unblock(args: dict, **kw) -> str:
     if ownership_err:
         return ownership_err
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_unblock", operation="unblock")
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1651,6 +1801,9 @@ def _handle_link(args: dict, **kw) -> str:
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
     board = args.get("board")
+    board_err = _enforce_board_acl(board, tool_name="kanban_link", operation="link")
+    if board_err:
+        return board_err
     try:
         kb, conn = _connect(board=board)
         try:
