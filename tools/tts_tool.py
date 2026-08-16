@@ -3573,6 +3573,45 @@ def _coerce_bool_arg(value: Any, default: bool) -> bool:
     return default
 
 
+
+def _resolve_tts_voice(provider: str, tts_config: dict) -> str:
+    """Resolve the configured voice id for the given provider."""
+    prov_cfg = (tts_config or {}).get(provider, {})
+    if isinstance(prov_cfg, dict):
+        return prov_cfg.get("voice") or prov_cfg.get("voice_id") or "default"
+    return "default"
+
+
+_VOICED_RECEIPTS_LOG = "/tmp/speak_receipts.jsonl"
+
+
+def _log_voiced_receipt(*, origin: str, voice: str, played: bool,
+                        provider: str = "", wav=None, text: str = "") -> None:
+    """Append a VOICED emission receipt to the shared ledger (t_30113a5a).
+
+    Best-effort: never raises. The ledger at /tmp/speak_receipts.jsonl is
+    the single file where all three origins (hermes_agent, syndicate_table,
+    syndicate_narrator) are distinguishable.
+    """
+    import datetime as _dt
+    try:
+        entry = {
+            "origin": origin,
+            "voice": voice,
+            "played": played,
+            "provider": provider,
+            "ts": _dt.datetime.now().isoformat(),
+        }
+        if wav:
+            entry["wav"] = wav
+        if text:
+            entry["text"] = text
+        with open(_VOICED_RECEIPTS_LOG, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+
 def text_to_speech_tool(
     text: str,
     output_path: Optional[str] = None,
@@ -3774,6 +3813,17 @@ def text_to_speech_tool(
                 f"{os.path.getsize(path):,}",
                 provider,
             )
+        # VOICED surface tagging (t_30113a5a, spec §2.2): log every Hermes
+        # TTS emission to /tmp/speak_receipts.jsonl with origin=hermes_agent,
+        # voice, played, and the provider. Same ledger as syndicate speak engines.
+        _log_voiced_receipt(
+            origin="hermes_agent",
+            voice=_resolve_tts_voice(provider, tts_config),
+            played=True,
+            provider=provider,
+            wav=final_paths[0] if final_paths else None,
+            text=text[:200],
+        )
         media_tag = "\n".join(f"MEDIA:{path}" for path in final_paths)
         if voice_compatible:
             media_tag = f"[[audio_as_voice]]\n{media_tag}"
