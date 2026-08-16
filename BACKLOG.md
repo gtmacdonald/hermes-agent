@@ -457,3 +457,134 @@ btw at HH:MM") and the profile-graph entries above (the status
 card is the simplest possible read of "what is each profile
 doing right now," which the drift-detection and config-graph
 entries want anyway).
+
+### Linked speech/model settings across profiles — declare once, sync everywhere {#profile-settings-linking}
+
+Gregory, 2026-08-15: profile configs are fully independent files with
+no inheritance, so converging all 13 profiles on the same speech stack
+(MLX Kokoro TTS + MLX Whisper STT) meant a hand-rolled yaml round-trip
+script touching every `config.yaml` and `.env`. That works once, but
+the settings immediately start drifting again. Profiles should be able
+to **link** selected config sections (speech, model/providers, or
+both) to a source so they stay in sync.
+
+**The behavior:**
+- A profile's `config.yaml` can declare something like
+  `link: { from: default, sections: [tts, stt, voice] }` (or
+  `sections: [model, providers, fallback_providers]` for the model
+  lane) instead of carrying its own copy.
+- `load_config()` resolves the link at read time — linked sections
+  come from the source profile's file, everything else stays local.
+  No file rewriting, no sync step, no drift.
+- Unlinked keys inside a linked section could allow local overrides
+  (deep-merge, local wins) — or v1 can keep it all-or-nothing per
+  section for simplicity.
+- CLI affordances: `hermes profile link <name> --from default
+  --sections tts,stt` and `hermes config get --resolved` to show the
+  effective merged view.
+
+**Why now:** the 2026-08-15 MLX speech migration touched 13 configs +
+13 `.env` files; the earlier fallback-chain sync (2026-08-12) touched
+4; each new profile re-inherits nothing and silently drifts (stale
+`tts.openai` blocks pointing at retired :8765 kokoro survived in three
+profiles for five days). `sync-model-config.py` treats the symptom;
+linking removes the copy step entirely.
+
+**Sketch:**
+- Resolution belongs in `hermes_cli/config.py:load_config()` — after
+  reading the profile yaml, if a `link` block exists, read the source
+  profile's yaml and graft the named top-level sections in before
+  validation. Cycle guard: a source profile with its own `link` is an
+  error (one level deep only, v1).
+- Env-var linking is separate: `HERMES_LOCAL_STT_COMMAND` lives in
+  `.env` per profile. Either move the STT command into `config.yaml`
+  proper (it has a `stt.local_command` shaped hole already) or let
+  `.env` loading fall back to the source profile's `.env` for missing
+  keys.
+- Watch out: `hermes config set` on a linked section should either
+  refuse ("linked from default — edit there or unlink") or
+  auto-unlink loudly. Silent local shadowing recreates the drift this
+  exists to kill.
+
+**Open questions:**
+- Link target: profile name (`from: default`) or a shared fragment
+  file (`~/.hermes/shared/speech.yaml`) that any profile can point
+  at? Fragment file is cleaner (no "which profile is canonical"
+  question) but adds a new config surface. Lean profile-name v1 —
+  default is already the de-facto canonical home.
+- Should linked sections show in `hermes config get`? Yes, with a
+  `(linked from default)` annotation so drift-debugging stays sane.
+
+**Related:** [config layers + project graph]
+(#project-config-graph-lifecycle) wants a general global → project
+config layer — this is the minimal per-section version of the same
+idea, shippable without the whole graph. Also adjacent:
+[model/provider change propagation]
+(#model-provider-change-propagation) — a linked `model` section makes
+"change once, all profiles follow" free.
+
+### Declare fast-mode support per endpoint — capability flags for custom providers, clearer UI {#endpoint-fast-mode-capability}
+
+Gregory, 2026-08-15: Hermes has several "make it fast" knobs —
+`agent.service_tier`, `auxiliary.title_generation.prefer_fast_model`,
+reasoning-effort levels — but whether they DO anything depends
+entirely on the endpoint behind the provider, and nothing in config
+or UI says so. For OpenAI, `service_tier` is a real request field.
+For Anthropic, "fast" is a *different model* (haiku vs sonnet), not a
+tier. For OpenRouter it depends on the upstream route. For custom
+OpenAI-compatible endpoints (Switchyard, LM Studio, mlx_lm.server,
+speaches) the field is usually silently ignored. Sometimes "fast
+mode" is genuinely a model change, not a parameter — and the UI is
+fuzzy about which one the user is getting.
+
+**The behavior:**
+- Provider blocks (built-in and `providers.<name>` custom entries)
+  gain an optional capability declaration, e.g.:
+  `capabilities: { service_tier: false, fast_variant: "glm-4.7-flashx" }`
+  — "this endpoint ignores tier params; fast == switch to this
+  model." Or `service_tier: true` for endpoints that honor the
+  request field.
+- When a fast path is requested (UI toggle, `prefer_fast_model`,
+  service tier), Hermes resolves it through the declaration: pass the
+  param, swap the model, or surface "this provider has no fast mode"
+  — never silently send a no-op field.
+- UI: the model picker / settings page shows what "fast" concretely
+  means for the selected provider ("uses service_tier=flex", "switches
+  to glm-4.7-flashx", or "not supported") instead of a generic toggle.
+- Sensible built-in defaults for known providers (openai: tier;
+  anthropic/zai: model swap; openrouter: per-route unknown → ask or
+  probe); custom endpoints default to "none" until declared.
+
+**Why now:** Greg's tiering convention (chat glm-5.2, workers
+glm-4.7-flashx, "no flash for GLM-5") is exactly a fast-mode-is-a-
+model-change policy, and today it lives in memory/skills instead of
+config the UI can read. Meanwhile `agent.service_tier: auto` sits in
+every profile config even where the provider ignores it.
+
+**Sketch:**
+- Schema: extend provider config with a `capabilities` mapping
+  (validated, all keys optional). Resolution helper
+  `resolve_fast_mode(provider, model) -> {kind: tier|model|none, value}`
+  used by agent_init / transports / dashboard.
+- The transports already thread `service_tier` through request
+  overrides (`agent/transports/chat_completions.py`); gate that on the
+  capability so unsupported endpoints never see the field.
+- Fast-variant model swap can reuse the same plumbing as
+  `prefer_fast_model` title-gen path, generalized beyond titles.
+- Dashboard "Use as" flow and the desktop model picker read the same
+  declaration to label the toggle.
+
+**Open questions:**
+- Probe-or-declare for OpenRouter-style aggregators: a HEAD/models
+  probe can sometimes infer tier support, but declarations are
+  predictable. Lean declare-only v1.
+- Does `fast_variant` belong per-provider or per-model? Per-model is
+  more correct (sonnet→haiku, glm-5.2→glm-4.7-flashx) but heavier;
+  v1 could allow both with model-level winning.
+
+**Related:** [model/provider change propagation]
+(#model-provider-change-propagation) — meta-tiers (Slow/Medium/Fast)
+want these declarations as their ground truth. Also
+[profile settings linking](#profile-settings-linking) — capability
+declarations are exactly the kind of shared config that should be
+declared once and linked everywhere.
