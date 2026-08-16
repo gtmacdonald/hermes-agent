@@ -7,11 +7,18 @@
 #   fork    ~/src/hermes            upstream=NousResearch  origin=gtmacdonald
 #   install ~/.hermes/hermes-agent  remote "fork" -> the fork checkout
 #
-# Usage: scripts/sync-upstream-deploy.sh
+# Usage: scripts/sync-upstream-deploy.sh [--push-local-commits]
 # ponytail: merge-based (no rebase, no force-push); conflicts stop the script
 # for hand resolution in the fork, then rerun.
 
 set -euo pipefail
+
+PUSH_LOCAL=false
+case "${1:-}" in
+  --push-local-commits) PUSH_LOCAL=true ;;
+  "") ;;
+  *) echo "usage: $0 [--push-local-commits]"; exit 1 ;;
+esac
 
 FORK="$HOME/src/hermes"
 INSTALL="$HOME/.hermes/hermes-agent"
@@ -22,9 +29,17 @@ cd "$FORK"
 git diff --quiet && git diff --cached --quiet \
   || { echo "✗ fork has uncommitted changes — commit them first"; exit 1; }
 git fetch upstream
+git fetch origin
+# count before merging: afterwards origin/main..HEAD includes upstream commits
+LOCAL_ONLY=$(git rev-list --count origin/main..HEAD)
 git merge --no-edit upstream/main \
   || { echo "✗ merge conflict — resolve in $FORK, commit, rerun"; exit 1; }
-git push origin main
+if [[ "$LOCAL_ONLY" -gt 0 && "$PUSH_LOCAL" == false ]]; then
+  # the merge sits atop the local commits, so pushing anything would push them
+  echo "→ $LOCAL_ONLY local commit(s) not on origin — skipping push (rerun with --push-local-commits to publish)"
+else
+  git push origin main
+fi
 
 # ── 2. install: fast-forward onto the fork ──────────────────────────────────
 cd "$INSTALL"
