@@ -54,7 +54,10 @@ git merge --ff-only fork/main \
 # ── 3. deps: sync venv only when the lockfile moved ─────────────────────────
 if ! git diff --quiet "$OLD_HEAD"..HEAD -- uv.lock pyproject.toml; then
   echo "→ lockfile changed; syncing venv"
-  VIRTUAL_ENV="$INSTALL/venv" "$UV" sync --frozen --no-dev
+  # Mirror scripts/install.sh: editable [all] baseline. NOT `uv sync` — sync
+  # ignores VIRTUAL_ENV (2026-08-16: silently targeted .venv for months) and
+  # prunes the lazy_deps.py packages the install accretes at first use.
+  VIRTUAL_ENV="$INSTALL/venv" "$UV" pip install -e '.[all]'
 fi
 
 # ── 4. restart services ─────────────────────────────────────────────────────
