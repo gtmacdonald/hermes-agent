@@ -172,6 +172,14 @@ export interface Translations {
     updateReadyMessage: (count: number) => string
     updateReadyMessageUnknown: string
     seeWhatsNew: string
+    mcp: {
+      needsAuthTitle: string
+      needsAuthMessage: (name: string) => string
+      errorTitle: string
+      errorMessage: (name: string) => string
+      signIn: string
+      view: string
+    }
     errors: {
       elevenLabsNeedsKey: string
       elevenLabsRejectedKey: string
@@ -758,6 +766,9 @@ export interface Translations {
       catalogEnvPrompt: (name: string) => string
       catalogEnvRequired: string
       capabilitySummary: (tools: number, prompts: number, resources: number) => string
+      costTokens: (tokens: string) => string
+      usage30d: (uses: string) => string
+      unusedPill: string
       statusConnecting: string
       statusNeedsAuth: string
       statusError: string
@@ -771,6 +782,18 @@ export interface Translations {
       enableTool: (tool: string) => string
       disableTool: (tool: string) => string
       noOutput: string
+      deepLinkTitle: string
+      deepLinkDescription: string
+      deepLinkStdioWarning: string
+      deepLinkConfirm: string
+      deepLinkNameInvalid: string
+      deepLinkNameConflict: (name: string) => string
+      deepLinkErrorTitle: string
+      deepLinkErrorName: string
+      deepLinkErrorConfig: string
+      deepLinkErrorShape: string
+      deepLinkErrorUrl: string
+      deepLinkErrorTooLarge: string
     }
     model: {
       loading: string
@@ -2642,6 +2665,7 @@ export interface Translations {
     stopFailed: string
     regenerateFailed: string
     editFailed: string
+    editTurnUnavailable: string
     resumeFailed: string
     resumeStrandedTitle: string
     resumeStrandedBody: string
