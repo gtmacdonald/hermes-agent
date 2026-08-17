@@ -393,6 +393,57 @@ class TestStringTypedConfigValues:
 
 
 # ---------------------------------------------------------------------------
+# Collection-literal coercion — regression tests for the dict sibling of the
+# list-coercion bug (t_b59a3c06 / t_16aede32).
+# ---------------------------------------------------------------------------
+
+class TestCollectionLiteralCoercion:
+    """``hermes config set <key> '{"k": ...}'`` must store a real mapping (not
+    a quoted JSON string) for non-string-typed keys.  Symptom before the fix:
+    the Desktop model picker rendered one entry containing the raw JSON blob.
+    String-typed keys (display.skin, approvals.mode, etc.) keep literal text.
+    """
+
+    def _write_config(self, home, body):
+        (home / "config.yaml").write_text(body)
+
+    def test_dict_literal_stored_as_mapping(self, _isolated_hermes_home):
+        payload = '{"hermes": {"tier": "auto"}, "openai-route": {"tier": "auto"}}'
+        set_config_value("providers.switchyard.models", payload, force=True)
+
+        import yaml
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        models = saved["providers"]["switchyard"]["models"]
+        assert isinstance(models, dict), f"expected dict, got {type(models).__name__}"
+        assert set(models) == {"hermes", "openai-route"}
+        assert models["hermes"]["tier"] == "auto"
+        assert models["openai-route"]["tier"] == "auto"
+
+    def test_list_literal_stored_as_list(self, _isolated_hermes_home):
+        payload = '["~/src", "~/src/syndicate"]'
+        set_config_value("desktop.repo_scan_roots", payload, force=True)
+
+        import yaml
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        roots = saved["desktop"]["repo_scan_roots"]
+        assert isinstance(roots, list)
+        assert roots == ["~/src", "~/src/syndicate"]
+
+    def test_string_typed_key_is_not_coerced(self, _isolated_hermes_home):
+        """A value that *looks* like a JSON object must NOT be parsed when the
+        key's default is a string — e.g. display.skin could plausibly be
+        ``"{"foo":1}"`` but should remain the verbatim string."""
+        payload = '{"looks": "like-json"}'
+        set_config_value("approvals.mode", payload, force=True)
+
+        import yaml
+        saved = yaml.safe_load(_read_config(_isolated_hermes_home))
+        # approvals.mode is string-typed (default "off"); it stays a string.
+        assert saved["approvals"]["mode"] == payload
+        assert isinstance(saved["approvals"]["mode"], str)
+
+
+# ---------------------------------------------------------------------------
 # Secret redaction in display output (issue #50245)
 # ---------------------------------------------------------------------------
 

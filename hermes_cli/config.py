@@ -5360,7 +5360,23 @@ def set_config_value(key: str, value: str, force: bool = False):
     # retain the historical best-effort coercion behavior.
     coerced_value: Any = value
     if not isinstance(_default_value_for_key(key), str):
-        if value.lower() in {'true', 'yes', 'on'}:
+        stripped = value.strip()
+        if stripped[:1] in ("[", "{"):
+            # A JSON/YAML collection literal (e.g. `hermes config set
+            # providers.switchyard.models '{"hermes": {}}'` or
+            # `hermes config set desktop.repo_scan_roots '["~/src"]'`).
+            # Before this parse, the literal was stored as a quoted STRING,
+            # which typed readers (isinstance(..., dict/list) guards) silently
+            # rejected — falling back to empty/default with no warning.  Fix
+            # for the dict sibling of the list-coercion bug (t_b59a3c06): the
+            # picker saw a raw JSON blob instead of grouped route metadata.
+            try:
+                parsed = fast_safe_load(stripped)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, (list, dict)):
+                coerced_value = parsed
+        elif value.lower() in {'true', 'yes', 'on'}:
             coerced_value = True
         elif value.lower() in {'false', 'no', 'off'}:
             coerced_value = False
