@@ -2727,6 +2727,23 @@ def run_conversation(
                         is_github_responses=agent._is_copilot_url(),
                         sanitize_harmony_tokens=agent._is_codex_backend(),
                     )
+                # Switchyard attribution (2026-08-17): when the main chat
+                # rides the local switchyard router, tag the request with
+                # session/turn intake headers so its routing log can tie
+                # spend to this conversation. Loopback-gated, inert for every
+                # other provider. See agent/switchyard_attribution.py.
+                try:
+                    from agent.switchyard_attribution import apply_to_request_kwargs
+
+                    apply_to_request_kwargs(
+                        api_kwargs,
+                        base_url=str(agent.base_url or ""),
+                        task="main",
+                        session_id=str(agent.session_id or ""),
+                        turn_id=str(turn_id or ""),
+                    )
+                except Exception:
+                    pass
                 # Copilot x-initiator: the first API call of a user turn is
                 # marked "user" so Copilot bills a premium request; tool-loop
                 # follow-ups keep the default "agent" header (#3040).

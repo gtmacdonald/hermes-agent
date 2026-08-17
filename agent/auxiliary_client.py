@@ -4660,8 +4660,14 @@ def _retry_same_provider_sync(
     # Preserve per-request attribution headers (e.g. Copilot's
     # ``x-initiator: user``) across the rebuilt-client retry — dropping them
     # here would let a recovery retry silently lose capability gating (#60293).
+    # Loopback routers (switchyard) already received ambient attribution
+    # headers from ``_build_call_kwargs``; merge, never clobber.
     if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+        from agent.switchyard_attribution import merge_attribution_headers
+
+        retry_kwargs["extra_headers"] = merge_attribution_headers(
+            extra_headers, retry_kwargs.get("extra_headers") or {}
+        )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -4733,9 +4739,14 @@ async def _retry_same_provider_async(
         task=task,
     )
     # Preserve per-request attribution headers across the rebuilt-client
-    # retry — see the sync variant above (#60293).
+    # retry — see the sync variant above (#60293). Merge with the ambient
+    # switchyard attribution already added by ``_build_call_kwargs``.
     if extra_headers:
-        retry_kwargs["extra_headers"] = dict(extra_headers)
+        from agent.switchyard_attribution import merge_attribution_headers
+
+        retry_kwargs["extra_headers"] = merge_attribution_headers(
+            extra_headers, retry_kwargs.get("extra_headers") or {}
+        )
     if _is_anthropic_compat_endpoint(resolved_provider, retry_base):
         retry_kwargs["messages"] = _convert_openai_images_to_anthropic(retry_kwargs["messages"])
     return _validate_llm_response(
@@ -8371,12 +8382,29 @@ def _build_call_kwargs(
     base_url: Optional[str] = None,
     task: Optional[str] = None,
 ) -> dict:
-    """Build kwargs for .chat.completions.create() with model/provider adjustments."""
+    """Build kwargs for .chat.completions.create() with model/provider adjustments.
+
+    For loopback endpoints (switchyard router) the request also gains
+    attribution headers (``proxy_x_session_id`` / ``x-switchyard-intake-task``
+    / ``x-switchyard-trial-id``) so its routing log can tie spend back to a
+    session and aux job — see ``agent/switchyard_attribution.py``. They merge
+    under ``extra_headers`` and are inert for any other loopback service.
+    """
     kwargs: Dict[str, Any] = {
         "model": model,
         "messages": messages,
         "timeout": timeout,
     }
+    try:
+        from agent.switchyard_attribution import apply_to_request_kwargs
+
+        apply_to_request_kwargs(
+            kwargs,
+            base_url=base_url,
+            task=task,
+        )
+    except Exception:
+        pass
 
     fixed_temperature = _fixed_temperature_for_model(model, base_url)
     if fixed_temperature is OMIT_TEMPERATURE:
@@ -9329,7 +9357,14 @@ def _call_llm_impl(
         reasoning_config=reasoning_config,
         base_url=_base_info or resolved_base_url, task=task)
     if extra_headers:
-        kwargs["extra_headers"] = dict(extra_headers)
+        # Merge caller headers with the ambient switchyard attribution that
+        # _build_call_kwargs may have added for loopback base URLs — caller
+        # values win, attribution keys are preserved on collision-free merge.
+        from agent.switchyard_attribution import merge_attribution_headers
+
+        kwargs["extra_headers"] = merge_attribution_headers(
+            extra_headers, kwargs.get("extra_headers") or {}
+        )
 
     # Convert image blocks for Anthropic-compatible endpoints (e.g. MiniMax)
     _client_base = str(getattr(client, "base_url", "") or "")
