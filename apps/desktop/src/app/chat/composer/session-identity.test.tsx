@@ -21,6 +21,7 @@ const view = (over: Partial<SessionView> = {}): SessionView => ({
   $reasoningEffort: atom(''),
   $runtimeId: atom('runtime-1'),
   $storedId: atom('stored-1'),
+  $turnStartedAt: atom(null),
   ...over
 })
 
