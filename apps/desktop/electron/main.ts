@@ -4364,6 +4364,7 @@ function createPythonBackend(root, label, backendArgs, options: any = {}) {
   const venvRoot = path.join(root, 'venv')
   const venvPython = getVenvPython(venvRoot)
   const command = IS_WINDOWS && fileExists(venvPython) ? venvPython : python
+
   const env = buildDesktopBackendEnv({
     hermesHome: HERMES_HOME,
     pythonPathEntries: [root, ...getVenvSitePackagesEntries(venvRoot)],
@@ -15037,6 +15038,7 @@ async function resolveForkSuffix(): Promise<string> {
     for (const name of (await git(['remote'])).split(/\s+/).filter(Boolean)) {
       if (canonicalGitHubRemote(await git(['remote', 'get-url', name])) === OFFICIAL_REPO_CANONICAL) {
         ref = `${name}/main`
+
         break
       }
     }

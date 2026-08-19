@@ -84,6 +84,7 @@ export function ModelOverrideField({
 }) {
   const k = useKanban()
   const [open, setOpen] = useState(false)
+
   // The picker already fetches this catalog, but this detached field also needs
   // it while closed so a persisted pin can visibly warn after a provider drops
   // a model. Same global query key means opening the menu does not fetch twice.
@@ -91,6 +92,7 @@ export function ModelOverrideField({
     queryKey: modelOptionsQueryKey(undefined),
     queryFn: () => requestModelOptions({})
   })
+
   const unavailable = isOverrideUnavailable(catalog?.providers, value)
 
   // ── one gesture, one onChange ──────────────────────────────────────────────
