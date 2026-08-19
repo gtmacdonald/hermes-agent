@@ -286,6 +286,40 @@ function dropOriginRecord(origin: string, except: DiskPlugin): void {
   dropPlugin(origin)
 }
 
+/** Does `file` exist under `folder`, WITHOUT asking for it and catching the
+ *  miss? Probing with readFileText rejects the IPC call, and Electron prints a
+ *  stack trace for every rejected ipcMain.handle — so an ordinary Python-only
+ *  plugin (no `desktop/plugin.js` half) logged one on every scan pass, which
+ *  reads like a failure and is not. Walk down from the folder, which the
+ *  directory listing just told us exists, so the normal miss is a listing that
+ *  simply lacks the name. */
+async function entryFileExists(folder: string, file: string): Promise<boolean> {
+  const desktop = window.hermesDesktop!
+  const segments = file.slice(folder.length + 1).split('/')
+  let dir = folder
+
+  for (const [index, segment] of segments.entries()) {
+    const wantDirectory = index < segments.length - 1
+    let entries
+
+    try {
+      ;({ entries } = await desktop.readDir(dir))
+    } catch {
+      return false // Raced a delete; the next pass reconciles.
+    }
+
+    const hit = entries.find(candidate => candidate.name === segment)
+
+    if (!hit || hit.isDirectory !== wantDirectory) {
+      return false
+    }
+
+    dir = `${dir}/${segment}`
+  }
+
+  return true
+}
+
 async function loadDiskPlugin(entry: DiskPlugin): Promise<void> {
   const desktop = window.hermesDesktop!
   const prevId = entry.id
@@ -355,9 +389,7 @@ async function scanDiskPlugins(): Promise<void> {
           continue
         }
 
-        try {
-          await desktop.readFileText(file)
-        } catch {
+        if (!(await entryFileExists(dir.path, file))) {
           continue // No entry file (yet) — not a plugin folder for this root.
         }
 

@@ -72,22 +72,56 @@ describe('scanDiskPlugins (#66899)', () => {
     expect(readDir).not.toHaveBeenCalled()
   })
 
-  it('probes desktop/plugin.js inside agent-plugin packages (unified packaging)', async () => {
+  it('looks for desktop/plugin.js inside agent-plugin packages without asking for a missing file', async () => {
     desktopPluginsRoot.mockResolvedValue('/local/.hermes/desktop-plugins')
     agentPluginsRoot.mockResolvedValue('/local/.hermes/plugins')
+    // A Python-only package: plugin.yaml + __init__.py, no desktop half.
     readDir.mockImplementation(async dir =>
       dir === '/local/.hermes/plugins'
         ? { entries: [{ isDirectory: true, name: 'my-feature', path: '/local/.hermes/plugins/my-feature' }] }
-        : { entries: [] }
+        : dir === '/local/.hermes/plugins/my-feature'
+          ? {
+              entries: [
+                { isDirectory: false, name: 'plugin.yaml', path: '/local/.hermes/plugins/my-feature/plugin.yaml' }
+              ]
+            }
+          : { entries: [] }
     )
-    // No desktop half in this package — probe must target desktop/plugin.js.
     readFileText.mockRejectedValue(new Error('ENOENT'))
 
     await discoverRuntimePlugins()
 
-    expect(readFileText).toHaveBeenCalledWith('/local/.hermes/plugins/my-feature/desktop/plugin.js')
-    // The Python half's files must never be probed as a desktop entry.
-    expect(readFileText).not.toHaveBeenCalledWith('/local/.hermes/plugins/my-feature/plugin.js')
+    // The listing already says there is no desktop/ half, so nothing is read.
+    // Reading it and catching the miss rejects the IPC call, and Electron logs
+    // a stack trace for every rejected handler — noise on every scan pass.
+    expect(readDir).toHaveBeenCalledWith('/local/.hermes/plugins/my-feature')
+    expect(readFileText).not.toHaveBeenCalled()
+  })
+
+  it('does not mistake a desktop/plugin.js DIRECTORY for the entry file', async () => {
+    desktopPluginsRoot.mockResolvedValue('/local/.hermes/desktop-plugins')
+    agentPluginsRoot.mockResolvedValue('/local/.hermes/plugins')
+    readDir.mockImplementation(async dir => {
+      if (dir === '/local/.hermes/plugins') {
+        return { entries: [{ isDirectory: true, name: 'odd', path: '/local/.hermes/plugins/odd' }] }
+      }
+
+      if (dir === '/local/.hermes/plugins/odd') {
+        return { entries: [{ isDirectory: true, name: 'desktop', path: '/local/.hermes/plugins/odd/desktop' }] }
+      }
+
+      if (dir === '/local/.hermes/plugins/odd/desktop') {
+        return {
+          entries: [{ isDirectory: true, name: 'plugin.js', path: '/local/.hermes/plugins/odd/desktop/plugin.js' }]
+        }
+      }
+
+      return { entries: [] }
+    })
+
+    await discoverRuntimePlugins()
+
+    expect(readFileText).not.toHaveBeenCalled()
   })
 
   it('still scans the standalone root when agentPluginsRoot is absent (older shell)', async () => {
@@ -104,11 +138,23 @@ describe('scanDiskPlugins (#66899)', () => {
   it('loads a unified desktop half OPT-IN: inventoried but not activated by default', async () => {
     desktopPluginsRoot.mockResolvedValue('/local/.hermes/desktop-plugins')
     agentPluginsRoot.mockResolvedValue('/local/.hermes/plugins')
-    readDir.mockImplementation(async dir =>
-      dir === '/local/.hermes/plugins'
-        ? { entries: [{ isDirectory: true, name: 'uni', path: '/local/.hermes/plugins/uni' }] }
-        : { entries: [] }
-    )
+    readDir.mockImplementation(async dir => {
+      if (dir === '/local/.hermes/plugins') {
+        return { entries: [{ isDirectory: true, name: 'uni', path: '/local/.hermes/plugins/uni' }] }
+      }
+
+      if (dir === '/local/.hermes/plugins/uni') {
+        return { entries: [{ isDirectory: true, name: 'desktop', path: '/local/.hermes/plugins/uni/desktop' }] }
+      }
+
+      if (dir === '/local/.hermes/plugins/uni/desktop') {
+        return {
+          entries: [{ isDirectory: false, name: 'plugin.js', path: '/local/.hermes/plugins/uni/desktop/plugin.js' }]
+        }
+      }
+
+      return { entries: [] }
+    })
 
     const register = vi.fn()
 
