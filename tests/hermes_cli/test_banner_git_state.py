@@ -17,28 +17,65 @@ def test_format_banner_version_label_on_upstream_main():
     assert "local" not in value
 
 
-def test_get_git_banner_state_reads_origin_and_head(tmp_path):
+def test_get_git_banner_state_reports_merge_base_not_remote_tip(tmp_path):
+    """A fork is "+N since the upstream commit it merged", not "+N since the tip".
+
+    Counting against the tip charged every unmerged upstream commit to the
+    fork (+2028 carried for 51 real ones). The base is the merge base.
+    """
     from hermes_cli import banner
 
     repo_dir = tmp_path / "repo"
     (repo_dir / ".git").mkdir(parents=True)
 
     results = {
-        ("git", "rev-parse", "--short=8", "origin/main"): MagicMock(returncode=0, stdout="b2f477a3\n"),
-        ("git", "rev-parse", "--short=8", "HEAD"): MagicMock(returncode=0, stdout="af8aad31\n"),
-        ("git", "rev-list", "--count", "origin/main..HEAD"): MagicMock(returncode=0, stdout="3\n"),
+        ("git", "remote"): "origin\nupstream\n",
+        ("git", "remote", "get-url", "origin"): "https://github.com/someone/hermes-agent.git",
+        ("git", "remote", "get-url", "upstream"): "git@github.com:NousResearch/hermes-agent.git",
+        ("git", "merge-base", "upstream/main", "HEAD"): "0b879298aa\n",
+        ("git", "rev-parse", "--short=8", "0b879298aa"): "0b879298\n",
+        ("git", "rev-parse", "--short=8", "HEAD"): "32aae64c\n",
+        ("git", "rev-list", "--count", "0b879298aa..HEAD"): "51\n",
+        ("git", "rev-list", "--count", "HEAD..upstream/main"): "91\n",
     }
 
     def fake_run(cmd, **kwargs):
         key = tuple(cmd)
         if key not in results:
             raise AssertionError(f"unexpected command: {cmd}")
-        return results[key]
+        return MagicMock(returncode=0, stdout=results[key])
 
     with patch("hermes_cli.banner.subprocess.run", side_effect=fake_run):
         state = banner.get_git_banner_state(repo_dir)
 
-    assert state == {"upstream": "b2f477a3", "local": "af8aad31", "ahead": 3}
+    assert state == {
+        "upstream": "0b879298",
+        "local": "32aae64c",
+        "ahead": 51,
+        "behind": 91,
+        "fork": True,
+    }
+
+
+def test_format_banner_version_label_names_the_fork():
+    from hermes_cli import banner
+
+    with patch.object(
+        banner,
+        "get_git_banner_state",
+        return_value={
+            "upstream": "0b879298",
+            "local": "32aae64c",
+            "ahead": 51,
+            "behind": 91,
+            "fork": True,
+        },
+    ):
+        value = banner.format_banner_version_label()
+
+    assert "fork 32aae64c (+51 carried commits)" in value
+    assert "upstream 0b879298" in value
+    assert "91 behind" in value
 
 
 def test_check_via_local_git_ssh_fastpath_ahead_not_behind(tmp_path):

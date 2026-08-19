@@ -172,6 +172,24 @@ def _is_official_ssh_remote(url: str | None) -> bool:
     return _is_ssh_remote(url) and _canonical_github_remote(url) == _OFFICIAL_REPO_CANONICAL
 
 
+def _official_remote_ref(repo_dir: Path) -> Optional[str]:
+    """Return ``<remote>/main`` for the remote pointing at the canonical
+    NousResearch repo, or None when this checkout has no such remote.
+
+    Matched on URL, not on remote NAME: a fork checkout names it ``upstream``
+    (``origin`` is the user's own fork) while a stock install names it
+    ``origin``. Both must report the same "upstream commit you're on".
+    """
+    remotes = _git_stdout(["remote"], cwd=repo_dir)
+    if not remotes:
+        return None
+    for name in remotes.split():
+        url = _git_stdout(["remote", "get-url", name], cwd=repo_dir)
+        if _canonical_github_remote(url) == _OFFICIAL_REPO_CANONICAL:
+            return f"{name}/main"
+    return None
+
+
 def _git_stdout(args: list[str], *, cwd: Path, timeout: int = 5) -> Optional[str]:
     try:
         result = subprocess.run(
@@ -522,47 +540,56 @@ def get_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
 def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]:
     repo_dir = repo_dir or _resolve_repo_dir()
     if repo_dir is None:
-        # No git checkout — try the baked build SHA (Docker image path).
-        try:
-            from hermes_cli.build_info import get_build_sha
-            baked = get_build_sha(short=8)
-            if baked:
-                return {"upstream": baked, "local": baked, "ahead": 0}
-        except Exception:
-            pass
-        return None
+        return _baked_banner_state()
 
-    upstream = _git_short_hash(repo_dir, "origin/main")
+    # The upstream commit we are ON is the merge base, not the remote tip.
+    # Counting HEAD against the tip charged every unmerged upstream commit to
+    # the fork: this checkout reported "+2028 carried commits" for 51 real
+    # ones, because its origin/main ref was a week-old NousResearch snapshot.
+    official = _official_remote_ref(repo_dir)
+    ref = official or "origin/main"
     local = _git_short_hash(repo_dir, "HEAD")
+    base = _git_stdout(["merge-base", ref, "HEAD"], cwd=repo_dir)
+    upstream = _git_short_hash(repo_dir, base) if base else None
     if not upstream or not local:
-        # Live-git lookup failed (e.g. shallow clone without origin/main).
-        # Fall back to the baked build SHA if available.
-        try:
-            from hermes_cli.build_info import get_build_sha
-            baked = get_build_sha(short=8)
-            if baked:
-                return {"upstream": baked, "local": baked, "ahead": 0}
-        except Exception:
-            pass
-        return None
+        # Live-git lookup failed (e.g. shallow clone without the remote ref).
+        return _baked_banner_state()
 
-    ahead = 0
+    ahead = _git_count(repo_dir, f"{base}..HEAD")
+    return {
+        "upstream": upstream,
+        "local": local,
+        "ahead": ahead,
+        "behind": _git_count(repo_dir, f"HEAD..{ref}"),
+        # A fork either carries commits upstream doesn't have, or has no
+        # NousResearch remote at all. ponytail: `ahead` is only as fresh as
+        # the remote ref — a checkout that never fetches overstates it.
+        "fork": ahead > 0 or official is None,
+    }
+
+
+def _baked_banner_state() -> Optional[dict]:
+    """Fall back to the SHA baked in at build time (Docker image path).
+
+    A built image is pinned to one commit, so ahead/behind are both zero and
+    the banner shows a bare ``· upstream <sha>``.
+    """
     try:
-        result = subprocess.run(
-            ["git", "rev-list", "--count", "origin/main..HEAD"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=5,
-            cwd=str(repo_dir),
-        )
-        if result.returncode == 0:
-            ahead = int((result.stdout or "0").strip() or "0")
+        from hermes_cli.build_info import get_build_sha
+        baked = get_build_sha(short=8)
+        if baked:
+            return {"upstream": baked, "local": baked, "ahead": 0, "behind": 0, "fork": False}
     except Exception:
-        ahead = 0
+        pass
+    return None
 
-    return {"upstream": upstream, "local": local, "ahead": max(ahead, 0)}
+
+def _git_count(repo_dir: Path, rev_range: str) -> int:
+    out = _git_stdout(["rev-list", "--count", rev_range], cwd=repo_dir)
+    try:
+        return max(int(out or "0"), 0)
+    except ValueError:
+        return 0
 
 
 _RELEASE_URL_BASE = "https://github.com/NousResearch/hermes-agent/releases/tag"
@@ -620,15 +647,21 @@ def format_banner_version_label() -> str:
     if not state:
         return base
 
-    upstream = state["upstream"]
-    local = state["local"]
+    parts = [base]
     ahead = int(state.get("ahead") or 0)
+    behind = int(state.get("behind") or 0)
 
-    if ahead <= 0 or upstream == local:
-        return f"{base} · upstream {upstream}"
+    if state.get("fork") and ahead > 0:
+        carried = "commit" if ahead == 1 else "commits"
+        parts.append(f"fork {state['local']} (+{ahead} carried {carried})")
+    elif state.get("fork"):
+        parts.append(f"fork {state['local']}")
 
-    carried_word = "commit" if ahead == 1 else "commits"
-    return f"{base} · upstream {upstream} · local {local} (+{ahead} carried {carried_word})"
+    parts.append(f"upstream {state['upstream']}")
+    if behind > 0:
+        parts.append(f"{behind} behind")
+
+    return " · ".join(parts)
 
 
 # =========================================================================

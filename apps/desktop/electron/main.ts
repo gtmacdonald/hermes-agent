@@ -315,7 +315,12 @@ import {
 } from './update-count'
 import { waitForUpdateClearance } from './update-gate'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
-import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
+import {
+  canonicalGitHubRemote,
+  isOfficialSshRemote,
+  OFFICIAL_REPO_CANONICAL,
+  OFFICIAL_REPO_HTTPS_URL
+} from './update-remote'
 import {
   collectRelaunchArgs,
   observeUpdaterHandoff,
@@ -14980,6 +14985,73 @@ ipcMain.handle('hermes:updates:branch:set', async (_event, name) => {
 // real Hermes version instead of the Electron app's own package.json version,
 // which historically drifted (stuck at 0.0.2). Falls back to app.getVersion()
 // when the source tree can't be read (e.g. a packaged build without the repo).
+// Fork provenance for the version string. "0.20.4" alone cannot answer "am I
+// running the fork?", and the "(0.17.0)" macOS shows beside it is CFBundleVersion
+// from apps/desktop/package.json — an Electron build number, not a Hermes one.
+// Mirrors hermes_cli/banner.py::_compute_git_banner_state: the upstream commit
+// we are ON is the merge base, never the remote tip (the tip charges every
+// unmerged upstream commit to the fork).
+let forkSuffixCache: { at: number; value: string } | null = null
+
+async function resolveForkSuffix(): Promise<string> {
+  if (forkSuffixCache && Date.now() - forkSuffixCache.at < 60_000) {
+    return forkSuffixCache.value
+  }
+
+  let value = ''
+
+  try {
+    const root = resolveUpdateRoot()
+    const git = async (args: string[]) => (await runGit(args, { cwd: root })).stdout.trim()
+
+    // Matched on URL, not remote NAME: a fork calls it `upstream`, a stock
+    // install calls it `origin`. Both must report the same upstream commit.
+    let ref = ''
+
+    for (const name of (await git(['remote'])).split(/\s+/).filter(Boolean)) {
+      if (canonicalGitHubRemote(await git(['remote', 'get-url', name])) === OFFICIAL_REPO_CANONICAL) {
+        ref = `${name}/main`
+        break
+      }
+    }
+
+    const base = await git(['merge-base', ref || 'origin/main', 'HEAD'])
+
+    if (base) {
+      const [upstream, local, aheadStr, behindStr] = await Promise.all([
+        git(['rev-parse', '--short=8', base]),
+        git(['rev-parse', '--short=8', 'HEAD']),
+        git(['rev-list', '--count', `${base}..HEAD`]),
+        git(['rev-list', '--count', `HEAD..${ref || 'origin/main'}`])
+      ])
+
+      const carried = Number(aheadStr) || 0
+      const behind = Number(behindStr) || 0
+      const parts: string[] = []
+
+      if (carried > 0) {
+        parts.push(`fork ${local} (+${carried} carried)`)
+      } else if (!ref) {
+        parts.push(`fork ${local}`)
+      }
+
+      parts.push(`upstream ${upstream}`)
+
+      if (behind > 0) {
+        parts.push(`${behind} behind`)
+      }
+
+      value = ` · ${parts.join(' · ')}`
+    }
+  } catch {
+    // No git checkout (packaged install without .git) — show the bare version.
+  }
+
+  forkSuffixCache = { at: Date.now(), value }
+
+  return value
+}
+
 function resolveHermesVersion() {
   try {
     const root = resolveUpdateRoot()
@@ -15018,12 +15090,14 @@ async function detectRendererSkew() {
 // an app restart. macOS only — `showAboutPanel()` is a no-op elsewhere, and the
 // other platforms don't use this menu item.
 function showAboutPanelFresh() {
-  void detectRendererSkew().then(skew => {
+  void detectRendererSkew().then(async skew => {
+    const version = `${resolveHermesVersion()}${await resolveForkSuffix()}`
+
     app.setAboutPanelOptions({
       applicationName: APP_NAME,
       applicationVersion: skew.outOfSync
-        ? `${resolveHermesVersion()} — app build out of date, update the desktop app`
-        : resolveHermesVersion(),
+        ? `${version} — app build out of date, update the desktop app`
+        : version,
       copyright: 'Copyright © 2026 Nous Research'
     })
     app.showAboutPanel()
@@ -15034,7 +15108,7 @@ ipcMain.handle('hermes:version', async () => {
   const skew = await detectRendererSkew()
 
   return {
-    appVersion: resolveHermesVersion(),
+    appVersion: `${resolveHermesVersion()}${await resolveForkSuffix()}`,
     electronVersion: process.versions.electron,
     nodeVersion: process.versions.node,
     platform: process.platform,

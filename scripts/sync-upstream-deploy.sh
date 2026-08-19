@@ -59,6 +59,11 @@ git diff --quiet && git diff --cached --quiet \
   || { echo "✗ install has local changes — they belong in the fork; stash or move them"; exit 1; }
 OLD_HEAD=$(git rev-parse HEAD)
 git fetch fork
+# Refresh the NousResearch ref as well. The version banner derives "upstream
+# <sha> · +N carried · N behind" from it, and nothing else in the install ever
+# fetches it: the official-SSH update check probes by ls-remote and writes no
+# refs. Left stale, the ref made a 51-commit fork report "+2028 carried".
+git fetch origin main --quiet || true
 git merge --ff-only fork/main \
   || { echo "✗ install cannot fast-forward — it has commits the fork lacks; reconcile by hand"; exit 1; }
 
@@ -82,8 +87,9 @@ fi
 # content-hash stamp that `hermes gui` consults. Building by hand skips that
 # stamp, so the next launch rebuilds all over again. --build-only skips the
 # launch; --force-build ignores the stamp (drop it to rebuild only when the
-# desktop sources actually changed). PROJECT_ROOT resolves to $INSTALL even
-# though the venv imports the fork, so this lands where you run it.
+# desktop sources actually changed). Both PROJECT_ROOT and the venv's editable
+# install resolve to $INSTALL — the fork tree is the source you edit, never the
+# tree that runs — so this lands where you launch from.
 if [[ "$BUILD_DESKTOP" == true ]]; then
   echo "→ building desktop app (slowest step; ~minutes; skip with --skip-desktop)"
   "$INSTALL/venv/bin/hermes" desktop --build-only --force-build
