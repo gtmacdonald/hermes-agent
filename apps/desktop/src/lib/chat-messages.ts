@@ -1010,7 +1010,17 @@ function storedToolMessagePart(toolMessage: SessionMessage, fallbackIndex: numbe
   }
 }
 
-function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
+/**
+ * Give every tool call in `messages` a distinct id, renaming repeats rather
+ * than dropping them (the server-side sanitizer makes the same trade: a model
+ * that reuses an id still made two real calls, so both must survive).
+ *
+ * assistant-ui keys each content part as `toolCallId-<id>` WITHIN a message
+ * and throws "Duplicate key ... in useResources" on a collision, taking the
+ * whole workspace pane down — so this invariant has to hold on whatever list
+ * finally reaches the runtime, not just on one freshly converted page.
+ */
+export function withUniqueToolCallIds(messages: ChatMessage[]): ChatMessage[] {
   const seen = new Set<string>()
 
   return messages.map(message => {

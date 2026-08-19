@@ -2,10 +2,13 @@ import { describe, expect, it } from 'vitest'
 
 import type { ComposerAttachment } from '@/store/composer'
 
+import type { ChatMessage, ChatMessagePart } from './chat-messages'
 import {
   attachmentDisplayText,
   attachmentId,
+  coalesceToolOnlyAssistants,
   coerceThinkingText,
+  createToolMergeCache,
   messageCreatedAt,
   optimisticAttachmentRef,
   parseCommandDispatch,
@@ -237,6 +240,61 @@ describe('messageCreatedAt', () => {
   it('treats a zero / non-finite timestamp as absent', () => {
     expect(messageCreatedAt({ timestamp: 0 }, NOW).getTime()).toBe(NOW)
     expect(messageCreatedAt({ timestamp: Number.NaN }, NOW).getTime()).toBe(NOW)
+  })
+})
+
+describe('coalesceToolOnlyAssistants tool-call identity', () => {
+  // assistant-ui keys every content part by `toolCallId-<id>` WITHIN a message
+  // and throws "Duplicate key ... in useResources", taking the whole workspace
+  // pane down. Grafting a refreshed tail onto backfilled pages can hand us the
+  // same tool call twice (each page is de-duplicated against its own page), and
+  // the fold below concatenates parts — so the collision lands inside one message.
+  const toolPart = (toolCallId: string): ChatMessagePart =>
+    ({ args: {}, argsText: '{}', toolCallId, toolName: 'terminal', type: 'tool-call' }) as ChatMessagePart
+
+  const assistant = (id: string, parts: ChatMessagePart[]): ChatMessage => ({ id, parts, role: 'assistant' })
+
+  it('keeps a repeated tool call id renderable by renaming it, losing no call', () => {
+    const merged = coalesceToolOnlyAssistants(
+      [assistant('m1', [toolPart('toolu_01A')]), assistant('m2', [toolPart('toolu_01A')])],
+      createToolMergeCache()
+    )
+
+    expect(merged).toHaveLength(1)
+
+    const ids = merged[0].parts.flatMap(part => (part.type === 'tool-call' ? [part.toolCallId] : []))
+
+    expect(ids).toHaveLength(2)
+    expect(new Set(ids).size).toBe(2)
+    expect(ids[0]).toBe('toolu_01A')
+  })
+
+  it('keeps ids unique across messages the fold leaves separate', () => {
+    const merged = coalesceToolOnlyAssistants(
+      [
+        assistant('m1', [toolPart('toolu_01A')]),
+        { ...assistant('m2', [{ text: 'hi', type: 'text' } as ChatMessagePart]), role: 'user' },
+        assistant('m3', [toolPart('toolu_01A')])
+      ],
+      createToolMergeCache()
+    )
+
+    const ids = merged.flatMap(message =>
+      message.parts.flatMap(part => (part.type === 'tool-call' ? [part.toolCallId] : []))
+    )
+
+    expect(new Set(ids).size).toBe(ids.length)
+  })
+
+  it('keeps distinct tool calls when folding', () => {
+    const merged = coalesceToolOnlyAssistants(
+      [assistant('m1', [toolPart('toolu_01A')]), assistant('m2', [toolPart('toolu_01B')])],
+      createToolMergeCache()
+    )
+
+    const ids = merged[0].parts.flatMap(part => (part.type === 'tool-call' ? [part.toolCallId] : []))
+
+    expect(ids).toEqual(['toolu_01A', 'toolu_01B'])
   })
 })
 

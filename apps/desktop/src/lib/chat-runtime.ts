@@ -3,7 +3,13 @@ import type { ThreadMessage } from '@assistant-ui/react'
 import type { QuickModelOption } from '@/app/chat/composer/types'
 import type { ClientSessionState, CommandDispatchResponse } from '@/app/types'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
-import { type ChatMessage, type ChatMessagePart, chatMessageText, textPart } from '@/lib/chat-messages'
+import {
+  type ChatMessage,
+  type ChatMessagePart,
+  chatMessageText,
+  textPart,
+  withUniqueToolCallIds
+} from '@/lib/chat-messages'
 import { normalize } from '@/lib/text'
 import type { ComposerAttachment } from '@/store/composer'
 import type { ModelOptionsResponse, SessionInfo } from '@/types/hermes'
@@ -554,5 +560,10 @@ export function coalesceToolOnlyAssistants(messages: ChatMessage[], cache: ToolM
     out.push(message)
   }
 
-  return out
+  // Restore the unique-tool-call-id invariant this fold can break. Each page is
+  // de-duplicated against its own page when converted, never against the others,
+  // so grafting a refreshed tail onto backfilled history can carry one id twice —
+  // and concatenating the parts above lands both copies inside ONE message, which
+  // is exactly what assistant-ui's per-message key map refuses to render.
+  return withUniqueToolCallIds(out)
 }
