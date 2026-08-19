@@ -119,6 +119,15 @@ export default defineConfig(({ command }) => ({
     // imports stay lazy, and the file count stays in the tens.
     chunkSizeWarningLimit: 25000,
     rolldownOptions: {
+      // nanostores 1.4.0 tags `batch` with /* @__NO_SIDE_EFFECTS__ */, which is
+      // a lie: batch(fn) exists to CALL fn. Honoring the annotation, Rolldown
+      // deleted every `batch(() => …)` whose result is unused — callback and
+      // all — so the packaged build silently lost the publication step of
+      // ensureGatewayProfile/ensureGatewayAgent (store/profile.ts) and picking
+      // a profile did nothing at all. Dev never minifies, so it only ever broke
+      // for real users. Annotations buy a little dead code; a dependency
+      // mislabeling one function must not be able to delete our logic.
+      treeshake: { annotations: false },
       output: {
         advancedChunks: {
           groups: [
