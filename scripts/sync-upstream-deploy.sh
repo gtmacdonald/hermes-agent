@@ -1,24 +1,35 @@
 #!/usr/bin/env bash
-# sync-upstream-deploy.sh — pull upstream main into the fork, then fast-forward
-# the live install onto the fork's main. Replaces raw file copies between
-# trees, which is how the 2026-08-12 stale-file breakage happened: copying
-# fork files (old upstream base) over a newer install regressed core code.
+# sync-upstream-deploy.sh — pull upstream main into the fork, fast-forward the
+# live install onto the fork's main, then rebuild the desktop app you launch.
+# Replaces raw file copies between trees, which is how the 2026-08-12 stale-file
+# breakage happened: copying fork files (old upstream base) over a newer install
+# regressed core code.
 #
 #   fork    ~/src/hermes            upstream=NousResearch  origin=gtmacdonald
 #   install ~/.hermes/hermes-agent  remote "fork" -> the fork checkout
 #
-# Usage: scripts/sync-upstream-deploy.sh [--push-local-commits]
+# Usage: scripts/sync-upstream-deploy.sh [--push-local-commits] [--skip-desktop]
+#
+#   --skip-desktop  don't rebuild the Electron app. Deploying WITHOUT building
+#                   leaves you launching a stale bundle, so this is opt-out on
+#                   purpose — for a Python-only change you're about to iterate
+#                   on again, not for a deploy you intend to run.
 # ponytail: merge-based (no rebase, no force-push); conflicts stop the script
 # for hand resolution in the fork, then rerun.
 
 set -euo pipefail
 
 PUSH_LOCAL=false
-case "${1:-}" in
-  --push-local-commits) PUSH_LOCAL=true ;;
-  "") ;;
-  *) echo "usage: $0 [--push-local-commits]"; exit 1 ;;
-esac
+BUILD_DESKTOP=true
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --push-local-commits) PUSH_LOCAL=true ;;
+    --skip-desktop) BUILD_DESKTOP=false ;;
+    *) echo "usage: $0 [--push-local-commits] [--skip-desktop]"; exit 1 ;;
+  esac
+  shift
+done
 
 FORK="$HOME/src/hermes"
 INSTALL="$HOME/.hermes/hermes-agent"
@@ -60,8 +71,35 @@ if ! git diff --quiet "$OLD_HEAD"..HEAD -- uv.lock pyproject.toml; then
   VIRTUAL_ENV="$INSTALL/venv" "$UV" pip install -e '.[all]'
 fi
 
-# ── 4. restart services ─────────────────────────────────────────────────────
+# ── 4. desktop app: rebuild the bundle you actually launch ──────────────────
+# Syncing source is not deploying: `hermes gui` runs a COMPILED Electron bundle
+# at $INSTALL/apps/desktop/release/mac-arm64/Hermes.app, so a synced tree alone
+# leaves you running old renderer code (2026-08-18: a fixed workspace-pane crash
+# kept firing because only the Python side had moved).
+#
+# Delegate to the CLI rather than driving npm here — `hermes desktop` already
+# installs the workspace node deps, runs electron-builder --dir, and writes the
+# content-hash stamp that `hermes gui` consults. Building by hand skips that
+# stamp, so the next launch rebuilds all over again. --build-only skips the
+# launch; --force-build ignores the stamp (drop it to rebuild only when the
+# desktop sources actually changed). PROJECT_ROOT resolves to $INSTALL even
+# though the venv imports the fork, so this lands where you run it.
+if [[ "$BUILD_DESKTOP" == true ]]; then
+  echo "→ building desktop app (slowest step; ~minutes; skip with --skip-desktop)"
+  "$INSTALL/venv/bin/hermes" desktop --build-only --force-build
+else
+  echo "→ skipping desktop build (--skip-desktop)"
+fi
+
+# ── 5. restart services ─────────────────────────────────────────────────────
 launchctl kickstart -k "gui/$(id -u)/ai.hermes.gateway"        2>/dev/null || true
 launchctl kickstart -k "gui/$(id -u)/ai.hermes.gateway-studio" 2>/dev/null || true
 
-echo "✓ deployed $(git log -1 --format='%h %s') — restart the desktop app to pick it up"
+echo "✓ deployed $(git log -1 --format='%h %s')"
+if [[ "$BUILD_DESKTOP" == true ]]; then
+  echo "  desktop app rebuilt at $INSTALL/apps/desktop/release/mac-arm64/Hermes.app"
+  echo "  quit and relaunch it (a running app keeps the old bundle)"
+else
+  echo "  ⚠ desktop NOT rebuilt — the app still runs the previous bundle."
+  echo "    Rebuild with: $INSTALL/venv/bin/hermes desktop --build-only"
+fi
