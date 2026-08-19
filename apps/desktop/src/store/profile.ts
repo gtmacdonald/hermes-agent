@@ -352,6 +352,11 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
       // and batch() cannot rescue that: it would make the mismatched tuple
       // atomically observable rather than prevent it.
       if (!activate()) {
+        // Superseded (or disposed) mid-dial. Not an error — but it is the one
+        // way a switch can no-op with nothing thrown and nothing published, so
+        // say so rather than leaving the user staring at an unchanged sidebar.
+        console.warn('[profile] gateway switch superseded before it could publish', { target })
+
         return
       }
 
@@ -361,10 +366,12 @@ export async function ensureGatewayProfile(profile: string | null | undefined): 
         setConnection(connection)
       }
     })
-  })().catch(() => {
+  })().catch((err: unknown) => {
     // Descriptor lookup failed: the switch fails as a unit. Nothing was
     // published, so every atom still consistently describes the previous
-    // profile; the user can retry the switch.
+    // profile; the user can retry the switch. Log it — discarding it silently
+    // made a dead profile switch indistinguishable from a no-op.
+    console.error('[profile] gateway switch failed', { error: err, target })
   })
 
   try {

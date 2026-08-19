@@ -248,6 +248,7 @@ import {
   runPrimaryBackendStartup
 } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
+import { PROFILE_NAME_RE, resolvePrimaryProfile } from './primary-profile'
 import {
   assertLocalProfileCanStart,
   decideProfileDeleteAction,
@@ -767,12 +768,10 @@ const DESKTOP_BACKEND_OWNERSHIP_PATH = path.join(app.getPath('userData'), 'backe
 // local backend as. When set, startHermes() passes `hermes --profile <name>
 // dashboard …`, which deterministically pins HERMES_HOME (see
 // _apply_profile_override in hermes_cli/main.py) and bypasses the sticky
-// ~/.hermes/active_profile file. Unset (null) preserves the legacy behavior:
-// no --profile flag, so the backend honors active_profile / default.
+// ~/.hermes/active_profile file. Unset (null) does NOT mean "default" — the
+// backend then resolves the sticky file itself, so primaryProfileOverride()
+// reads it too rather than letting the two halves disagree.
 const DESKTOP_PROFILE_CONFIG_PATH = path.join(app.getPath('userData'), 'active-profile.json')
-// Mirrors hermes_cli.profiles._PROFILE_ID_RE so we never hand the backend a
-// value its profile resolver would reject and exit on.
-const PROFILE_NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/
 // Branch we track for self-update. The GUI work has merged to main, so this
 // tracks main. User can also override at runtime via
 // hermesDesktop.updates.setBranch().
@@ -9661,11 +9660,19 @@ async function waitForBackendExit(child, timeoutMs = 5000) {
   await wait(1000)
 }
 
-// The profile the primary (window) backend runs as. readActiveDesktopProfile()
-// returns the desktop's stored preference, or null when unset (legacy launch
-// that defers to active_profile / default).
+// What pins the primary (window) backend's profile, or null when nothing does.
+// The desktop's stored preference is only half the answer: with it unset the
+// backend still adopts the sticky <root>/active_profile, so this reads that
+// file too (see primary-profile.ts). Every "which profile is the primary on?"
+// question routes through here — the spawn flag, the renderer's boot adoption
+// and the profile-scoped plugin root — so they cannot name different profiles.
+function primaryProfileOverride() {
+  return resolvePrimaryProfile(HERMES_HOME, readActiveDesktopProfile())
+}
+
+// The same answer as a key: nothing pinned → the default root.
 function primaryProfileKey() {
-  return readActiveDesktopProfile() || 'default'
+  return primaryProfileOverride() || 'default'
 }
 
 // Options describing the current connection setup for `resolveProfileBackendRoute`.
@@ -10424,12 +10431,12 @@ async function startHermes() {
     const token = crypto.randomBytes(32).toString('base64url')
     // --port 0: the OS assigns an ephemeral port; the child announces it on stdout.
     const backendArgs = ['serve', '--host', '127.0.0.1', '--port', '0']
-    // Pin the desktop's chosen profile via the global --profile flag. This is
-    // deterministic (it wins over the sticky ~/.hermes/active_profile file) and
-    // resolves HERMES_HOME the same way `hermes -p <name>` does on the CLI. An
-    // unset preference keeps the legacy launch so existing installs are
-    // unaffected.
-    const activeProfile = readActiveDesktopProfile()
+    // Pin the primary's profile via the global --profile flag, resolving
+    // HERMES_HOME the same way `hermes -p <name>` does on the CLI. Passing it
+    // explicitly (rather than letting the backend re-read the sticky file)
+    // keeps the spawn deterministic AND keeps it in lockstep with the profile
+    // the renderer is told to adopt.
+    const activeProfile = primaryProfileOverride()
 
     if (activeProfile) {
       backendArgs.unshift('--profile', activeProfile)
@@ -13166,7 +13173,9 @@ ipcMain.handle('hermes:connection-config:apply', async (_event, payload) => {
   return sanitizeDesktopConnectionConfig(config, payload?.profile)
 })
 
-ipcMain.handle('hermes:profile:get', async () => ({ profile: readActiveDesktopProfile() }))
+// The renderer adopts this as $activeGatewayProfile at boot, so it must be the
+// profile the primary backend IS on, not merely the one the user pinned.
+ipcMain.handle('hermes:profile:get', async () => ({ profile: primaryProfileOverride() }))
 ipcMain.handle('hermes:profile:set', async (_event, name) => {
   const next = writeActiveDesktopProfile(name)
 
@@ -14628,8 +14637,8 @@ async function localPluginsRoot(dirName: string): Promise<string> {
   // Profile-aware: a named Desktop profile gets its own plugin root under
   // profiles/<name>/, matching the profile-scoped hermes_home the backend
   // reported before this resolver existed. 'default'/unset pins the global root.
-  const profile = readActiveDesktopProfile()
-  const base = profile && profile !== 'default' ? path.join(HERMES_HOME, 'profiles', profile) : HERMES_HOME
+  const profile = primaryProfileKey()
+  const base = profile !== 'default' ? path.join(HERMES_HOME, 'profiles', profile) : HERMES_HOME
   const dir = path.join(base, dirName)
 
   try {
