@@ -18,7 +18,10 @@ vi.mock('@/store/quick-entry', () => ({
 }))
 
 vi.mock('@/store/session-states', () => ({ sessionTileDelegate: () => null }))
-vi.mock('@/store/windows', () => ({ isSecondaryWindow: () => false }))
+// isAuxiliaryWindow is what the hook actually calls; isSecondaryWindow is one
+// of its two inputs. Mocking only the input leaves the export the hook needs
+// undefined, and the effect throws before it registers a submit handler.
+vi.mock('@/store/windows', () => ({ isAuxiliaryWindow: () => false, isSecondaryWindow: () => false }))
 
 function Harness({
   startFreshSessionDraft,
@@ -47,7 +50,9 @@ describe('useQuickEntryBridge global Quick Entry target', () => {
     expect(handler).toBeTypeOf('function')
     ;(handler as (payload: QuickEntrySubmitPayload) => void)({ target: QUICK_TARGET_NEW, text: 'Capture this' })
 
-    expect(startFreshSessionDraft).toHaveBeenCalledWith({ workspaceTarget: null })
+    // No arguments at all IS "no project cwd": the hook starts a plain fresh
+    // draft and lets the normal submit path create the backend session.
+    expect(startFreshSessionDraft).toHaveBeenCalledWith()
     expect(submitText).toHaveBeenCalledWith('Capture this')
 
     unmount()
