@@ -47,7 +47,17 @@ class TestWriteDenyExactPaths:
 
         assert _is_write_denied(str(global_env)) is True
 
-    def test_shell_profiles_are_writable(self):
+    def test_shell_profiles_are_writable(self, monkeypatch):
+        # t_4281c05c: the test's isolated HERMES_HOME is flat (not nested
+        # under profiles/<name>), so it resolves as the 'default' profile
+        # and the new default/home readonly posture would otherwise deny
+        # these paths under the real developer's ~ (Path.home() is not
+        # itself sandboxed by the test fixtures). Opt in for this test —
+        # it exercises the unrelated credential/shell-profile deny logic,
+        # not the default-home posture (covered separately in
+        # tests/agent/test_file_safety_default_home_readonly.py).
+        import agent.file_safety as fs
+        monkeypatch.setenv(fs.ALLOW_WRITE_DEFAULT_HOME_ENV, "1")
         home = str(Path.home())
         for name in [".bashrc", ".zshrc", ".profile", ".bash_profile", ".zprofile"]:
             assert _is_write_denied(os.path.join(home, name)) is False, f"{name} should be writable"
@@ -87,7 +97,14 @@ class TestWriteAllowed:
         assert _is_write_denied("/tmp/safe_file.txt") is False
 
 
-    def test_hermes_control_files_requested_writable(self):
+    def test_hermes_control_files_requested_writable(self, monkeypatch):
+        # t_4281c05c: opt in to bypass the default-home readonly posture —
+        # this test exercises that these paths aren't caught by the
+        # unrelated credential/mcp-tokens/session deny rules, not the
+        # default-home posture itself (see
+        # tests/agent/test_file_safety_default_home_readonly.py for that).
+        import agent.file_safety as fs
+        monkeypatch.setenv(fs.ALLOW_WRITE_DEFAULT_HOME_ENV, "1")
         from hermes_constants import get_hermes_home
 
         home = get_hermes_home()
