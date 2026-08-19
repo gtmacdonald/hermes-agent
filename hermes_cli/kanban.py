@@ -210,83 +210,6 @@ def _check_dispatcher_presence(
 
 
 # ---------------------------------------------------------------------------
-# Per-board ACL — default profile is the cross-profile orchestrator
-# ---------------------------------------------------------------------------
-# The default profile is Hermes' cross-profile coordinator (see
-# ``DEFAULT_PROFILE_ORCHESTRATOR_GUIDANCE`` in ``agent/prompt_builder.py``)
-# and may address any board on this installation (``syndicate``,
-# ``hermes-local-fork``, ``default``, plus any future board) via the
-# ``--board`` flag without per-board ACL entries. Non-default profiles
-# keep their existing profile-scoped board restrictions: they may only
-# target the env-pinned board. This pairs with the kanban-path write
-# carve-out in ``agent/file_safety.py`` (``_is_kanban_allowlisted`` /
-# ``classify_default_home_write``) — that carve-out lets the
-# default-profile write tools reach kanban DB files under the
-# otherwise-readonly ``~/`` and ``~/.hermes`` trees, and the bypass here
-# lets those same calls target any board regardless of the env-pinned
-# default. Both halves are required for the orchestrator posture
-# documented in ``agent/prompt_builder.py``.
-
-def _active_profile_name_or_default() -> str:
-    """Best-effort active Hermes profile name, with safe fallback.
-
-    Returns ``"default"`` on any resolution failure so the conservative
-    deny path fires (a non-default profile with broken resolution must
-    not silently inherit the orchestrator bypass).
-    """
-    try:
-        from hermes_cli.profiles import get_active_profile_name
-        return get_active_profile_name() or "default"
-    except Exception:
-        return "default"
-
-
-def _is_default_profile() -> bool:
-    """True when the active profile is Hermes' cross-profile orchestrator.
-
-    Mirrors ``tools/kanban_tools.py::_is_default_profile``. Kept
-    here as a separate function so the CLI's gate doesn't import the
-    tool module (the tool module imports the kanban DB module, which
-    imports the CLI — a cycle if the CLI imports the tool).
-    """
-    return _active_profile_name_or_default() == "default"
-
-
-def _cli_board_acl_error(board_override: Optional[str]) -> Optional[str]:
-    """Return an error string when ``--board <slug>`` should be refused.
-
-    Mirrors ``tools/kanban_tools.py::_enforce_board_acl`` for the
-    interactive CLI path: the default profile bypasses the per-board
-    ACL; non-default profiles must target the env-pinned board.
-    Returns ``None`` when the call is allowed. The returned message
-    has NO prefix — the dispatcher (``kanban_command``) prepends
-    ``"kanban: "`` before writing it to stderr.
-    """
-    if not board_override:
-        return None
-    if _is_default_profile():
-        return None
-    try:
-        pinned = kb.get_current_board()
-    except Exception:
-        pinned = None
-    if not pinned:
-        return None
-    try:
-        normed = kb._normalize_board_slug(board_override)
-    except ValueError:
-        normed = board_override
-    if normed == pinned:
-        return None
-    return (
-        f"profile is pinned to board {pinned!r}; cross-board access "
-        f"from a non-default profile is denied. Drop --board to use "
-        f"the env-pinned board, or run from the default profile, "
-        f"which is the designated cross-profile orchestrator."
-    )
-
-
-# ---------------------------------------------------------------------------
 # Argparse builder
 # ---------------------------------------------------------------------------
 
@@ -1151,16 +1074,6 @@ def kanban_command(args: argparse.Namespace) -> int:
         if not normed:
             print("kanban: --board requires a slug", file=sys.stderr)
             return 2
-        # Per-profile ACL — the default profile is Hermes' cross-profile
-        # orchestrator (see ``DEFAULT_PROFILE_ORCHESTRATOR_GUIDANCE``)
-        # and may address any board; non-default profiles are pinned to
-        # the env-pinned board. The check has to happen here in the
-        # dispatcher so every subcommand inherits the gate from one
-        # place rather than each handler re-implementing it.
-        board_acl_err = _cli_board_acl_error(board_override)
-        if board_acl_err:
-            print(f"kanban: {board_acl_err}", file=sys.stderr)
-            return 1
         # Boards other than 'default' must already exist — typoed slugs
         # would otherwise silently create an empty board.
         if normed != kb.DEFAULT_BOARD and not kb.board_exists(normed):
