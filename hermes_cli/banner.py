@@ -562,8 +562,10 @@ def _compute_git_banner_state(repo_dir: Optional[Path] = None) -> Optional[dict]
         "ahead": ahead,
         "behind": _git_count(repo_dir, f"HEAD..{ref}"),
         # A fork either carries commits upstream doesn't have, or has no
-        # NousResearch remote at all. ponytail: `ahead` is only as fresh as
-        # the remote ref — a checkout that never fetches overstates it.
+        # NousResearch remote at all. `ahead > 0` cannot false-positive on a
+        # stock install: `hermes update` fetches origin/<branch> and then
+        # fast-forwards ONTO it (update_cmd.py), so HEAD never outruns the ref
+        # it was updated from. Only a real local commit gets you here.
         "fork": ahead > 0 or official is None,
     }
 
