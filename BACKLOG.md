@@ -588,3 +588,83 @@ want these declarations as their ground truth. Also
 [profile settings linking](#profile-settings-linking) — capability
 declarations are exactly the kind of shared config that should be
 declared once and linked everywhere.
+
+## Token availability report — first-class `hermes tokens` command (2026-08-16)
+
+Prototype lives at `~/.hermes/scripts/token_report.py` (dual-surface py command,
+`--json` for agents). Promote into the fork as `hermes tokens`:
+
+- One minimal probe per configured provider (1-token chat call or credits
+  endpoint); harvest `anthropic-ratelimit-*` / `x-ratelimit-*` headers,
+  OpenRouter `/api/v1/credits`, LM Studio `/api/v0/models` loaded state.
+- Classify: OK / RATE-LIMITED / OUT-OF-CREDIT / AUTH-FAIL / UNREACHABLE.
+- Mix of metered subscriptions (Anthropic, Meta, Kimi-expiring, GLM daily
+  caps) + prepaid pools (OpenRouter) + unmetered locals (Aurora/M4).
+- Wire into fallback-chain health: a provider showing OUT-OF-CREDIT should be
+  soft-dropped from the chain instead of burning a failover attempt per turn.
+- Optional: cron tick + threshold alerts ("Anthropic in-tok-left < 10%").
+- Derive provider list from config providers + .env keys, not hardcoded.
+
+## Gateway/profile binding must be explicit (2026-08-16)
+
+Gateways are 1:1 with profiles, but a plist/service that omits `--profile`
+resolves the sticky `~/.hermes/active_profile` AT SPAWN TIME (floating
+gateway). Today two plists (ai.hermes.gateway without --profile, sticky=studio;
+ai.hermes.gateway-studio with --profile studio) resolved to the SAME profile
+and `--replace` kill-looped each other (743 vs 65 launchd respawns, 2,691
+SIGTERMs) while the default profile's cron store went untickled for 58h.
+
+- `gateway install` should always write an explicit `--profile <name>` into
+  the service definition; `gateway run` without --profile under a service
+  manager should refuse or log loudly which profile it bound.
+- Instance lock should be per-profile AND detect a same-profile sibling
+  service definition (two plists → same profile) and warn.
+- `hermes gateway status` should print the BOUND profile, not just the plist
+  label.
+
+## Desktop playback: pause button, speaking-flag, heard-receipts (2026-08-16)
+
+Fork-side half of syndicate card t_245c1952 (speaker arbitration + heard-receipt
+ledger). Three changes to the desktop voice path (PlaybackController /
+voice-playback.ts / bubble UI):
+
+1. Pause/resume/stop controls on the audio bubble (pause is currently not
+   wired at all — playback.py pause can't reach bubble audio).
+2. Speaking flag: touch/remove /tmp/hermes_speaking on play start/stop/pause
+   so the syndicate daemon's gong (P1) and future narration (P2) can yield.
+3. Heard-receipts: on completed/paused/stopped, write a row to
+   playback_receipts in state.db {utterance_id, source:hermes, session_id,
+   event, total_s, played_s, text_full, heard_through, unheard, at} using
+   proportional char interpolation (~15 chars/s, snap to sentence) until
+   per-sentence chunked synthesis exists. On the NEXT turn, inject a compact
+   system note: "[playback: user PAUSED at 40% — heard through '…'; unheard:
+   N sentences]" so the model can apply the contract: paused=wait,
+   stopped=tail is unsaid, completed=normal.
+
+Shared schema with syndicate say()-receipts (t_7d5a88f0) — one ledger, two
+writers. Do not invent a second receipt shape.
+
+## Dialogue channel: model-authored spoken block, separate from plain output (2026-08-16)
+
+Hermes has no dialogue channel — desktop TTS speaks the RAW reply
+(tui_gateway/server.py ~11090: `spoken = raw`; streaming path same text).
+The syndicate is dialogue-first (personas emit speakable lines + instruct
+directions); Hermes forces one text to serve display AND voice.
+
+Design (agreed direction 2026-08-16): model-authored dual channel.
+- Model emits an optional `<spoken>…</spoken>` block in its reply when voice
+  is active: 1-3 conversational sentences, syndicate-register, written AS
+  dialogue (may carry a leading (direction) for the voicedesign instruct
+  channel).
+- Renderer strips the block from displayed markdown; TTS speaks ONLY the
+  block. Plain model output stays untouched and is never voiced.
+- Fallback when no block present: deterministic extraction (normalizer +
+  first-paragraph heuristic), i.e. today's behavior.
+- Prompt side: extend TTS_SPOKEN_GUIDANCE (agent/prompt_builder.py) to teach
+  the channel (voice on -> include block; voice off -> never).
+- Composes with heard-receipt ledger (BACKLOG entry above + syndicate
+  t_245c1952): receipts measure the spoken block, so heard/unheard maps to
+  actual dialogue, not markdown walls.
+- Rejected alternatives: post-hoc aux-model filter (extra call + latency per
+  turn on primary lane); pure deterministic extraction (summarization by
+  truncation) — kept only as fallback.
