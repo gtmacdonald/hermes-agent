@@ -205,3 +205,10 @@ native/fts5_cjk/*.so
 # interrupted; consumed by launch-time recovery. Never commit it (was tracked
 # by accident via 3a69e34702, removed in the #72002 salvage).
 .lazy-refresh-incomplete
+
+# Profile snapshots. A 33MB tarball of the live `default` profile — session
+# request dumps, memories, SOUL.md — was committed by accident (9c1de72de5)
+# and pushed public before the history was rewritten. Profile data is never
+# source; keep it out by name and by shape.
+apps/desktop/default.tar.gz
+*.profile.tar.gz
