@@ -4760,7 +4760,8 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     # Hermes owns the auxiliary retry/timeout budget; disable SDK-internal retries.
     # See #54465.
     async_kwargs.setdefault("max_retries", 0)
-    return AsyncOpenAI(**async_kwargs), model
+    from agent.spend_policy import guard_client
+    return guard_client(AsyncOpenAI(**async_kwargs), async_mode=True), model
 
 
 def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:

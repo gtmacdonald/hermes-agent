@@ -280,6 +280,11 @@ def post_json(
     backend-specific HTTP error text."""
     import requests
 
+    from agent.spend_policy import prepare, SpendDenied
+    try:
+        payload = prepare(url, payload)
+    except SpendDenied as exc:
+        return None, HttpFailure("policy", str(exc), "model_spend_policy_denied")
     read_timeout = timeout[1] if isinstance(timeout, tuple) else timeout
     try:
         response = requests.post(url, headers=headers, json=payload, timeout=timeout)

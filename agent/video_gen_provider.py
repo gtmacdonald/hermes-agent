@@ -242,7 +242,8 @@ class OpenAICompatibleVideoGenProvider(VideoGenProvider):
         http_client = build_keepalive_http_client(client_kwargs["base_url"])
         if http_client is not None:
             client_kwargs["http_client"] = http_client
-        client = openai.OpenAI(**client_kwargs)
+        from agent.spend_policy import guard_client
+        client = guard_client(openai.OpenAI(**client_kwargs))
         try:
             try:
                 video = self._create_and_poll(client, call_kwargs)
