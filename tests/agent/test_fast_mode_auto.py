@@ -167,6 +167,19 @@ def test_unprovisioned_detects_only_zero_limit_fast_429s():
     assert fast_mode.fast_mode_unprovisioned(RuntimeError("boom"), _FAST_KWARGS) is False
 
 
+def test_unprovisioned_detects_oauth_credit_error_without_limit_headers():
+    err = RuntimeError("Error code: 429 - Usage credits are required for fast mode.")
+    err.status_code = 429
+    err.response = SimpleNamespace(headers={})
+    assert fast_mode.fast_mode_unprovisioned(err, _FAST_KWARGS) is True
+    # A 429 with neither a zero limit header nor the credit text stays transient.
+    plain = RuntimeError("rate limited")
+    plain.status_code = 429
+    assert fast_mode.fast_mode_unprovisioned(plain, _FAST_KWARGS) is False
+    # Same text on a request that did not ask for fast speed is not a fast-mode signal.
+    assert fast_mode.fast_mode_unprovisioned(err, {"model": "claude-opus-5"}) is False
+
+
 def test_unavailable_model_drops_speed_for_the_session_and_only_that_model():
     agent = _agent(
         service_tier="priority", model="claude-opus-5", provider="anthropic",
