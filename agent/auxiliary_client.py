@@ -7884,8 +7884,14 @@ def _ladder_provider_fallback(first_err: Exception, route: _LadderRoute):
     )
     if reason is None or not (is_auto or is_capacity_error or explicit_auth_with_task_chain):
         return None
-    if reason == "payment error" and (resolved_provider == "anthropic" or "api.anthropic.com" in str(route.base_info or "")):
-        raise RuntimeError("Anthropic Platform is unavailable; explicitly select an existing supported subscription harness. Automatic metered gateway spillover is disabled.") from first_err
+    if reason == "payment error":
+        from agent.anthropic_endpoints import is_native_anthropic_platform
+        if is_native_anthropic_platform(resolved_provider, route.base_info):
+            # Fork-local spending policy: a depleted Anthropic Platform balance never spills
+            # over to a metered gateway; the caller must pick a subscription harness.
+            raise RuntimeError(
+                "Anthropic Platform is unavailable; explicitly select an existing supported subscription "
+                "harness. Automatic metered gateway spillover is disabled.") from first_err
     if reason == "payment error":
         # Mark the concrete backend (not the "auto" label) unhealthy so later aux calls skip
         # it instead of paying another doomed RTT.
