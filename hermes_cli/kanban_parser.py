@@ -425,6 +425,12 @@ _SPECS = [
          help="List known profiles + per-profile task counts (union of ~/.hermes/profiles/ and current assignees on the board)"),
     _cmd("context", [_TASK_ID],
          help="Print the full context a worker sees for a task (title + body + parent results + comments)."),
+    _cmd("accept-spec", [
+        _TASK_ID,
+        _arg("--expected-spec-sha256", help="Hash from a reviewed dry-run; required for acceptance"),
+        _arg("--dry-run", action="store_true", help="Read and hash the specification without accepting it"),
+        _json_flag(),
+    ], help="Accept one reviewed existing triage specification into todo without an LLM or dispatch"),
     _cmd("specify", _triage_sweep_args("specify", "Specify", "specifier"),
          help="Flesh out a triage-column task into a concrete spec (title + "
               "body) and promote it to todo. Uses the auxiliary LLM "

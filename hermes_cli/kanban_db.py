@@ -3754,21 +3754,33 @@ def invalidate_descendants_for_parent_reopen(
 def specify_triage_task(
     conn: sqlite3.Connection, task_id: str, *, title: Optional[str] = None,
     body: Optional[str] = None, assignee: Optional[str] = None, author: Optional[str] = None,
+    expected_spec_sha256: Optional[str] = None, recompute: bool = True,
 ) -> bool:
     """Update title/body/assignee (when given) and move ``triage -> todo`` in one
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
+    A reviewed hash binds manual acceptance to all saved fields and forbids
+    active claims or rewriting. ``recompute=False`` leaves only this task in
+    todo; the default preserves existing specifier readiness behavior.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
     assignee = _canonical_assignee(assignee)
     with write_txn(conn):
         existing = conn.execute(
-            "SELECT title, body, assignee FROM tasks WHERE id = ? AND status = 'triage'",
+            "SELECT * FROM tasks WHERE id = ? AND status = 'triage'",
             (task_id,),
         ).fetchone()
         if existing is None:
             return False
+        if expected_spec_sha256 is not None:
+            from hermes_cli.kanban_manual_spec import spec_sha256
+            if spec_sha256(existing) != expected_spec_sha256:
+                raise ValueError("specification changed; review a fresh dry-run")
+            if any(existing[key] is not None for key in ("claim_lock", "current_run_id", "worker_pid")):
+                raise ValueError("task has an active claim or run")
+            if any(value is not None for value in (title, body, assignee)):
+                raise ValueError("manual acceptance cannot rewrite specification fields")
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
         changed_fields: list[str] = []
@@ -3804,7 +3816,8 @@ def specify_triage_task(
         )
     # Own IMMEDIATE txn (outside the one above): a parent-free specified task
     # flips to 'ready' now instead of idling until the next tick.
-    recompute_ready(conn)
+    if recompute:
+        recompute_ready(conn)
     return True
 
 
