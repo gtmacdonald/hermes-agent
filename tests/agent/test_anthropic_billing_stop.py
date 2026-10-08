@@ -17,6 +17,9 @@ _BILLING = SimpleNamespace(reason=FailoverReason.billing)
 
 @pytest.mark.parametrize("provider, base_url, expected", [
     ("anthropic", None, True),
+    ("anthropic", "", True),
+    ("anthropic", "https://api.anthropic.com", True),
+    ("anthropic", "https://gateway.example.com/anthropic", False),
     ("custom", "https://api.anthropic.com/v1", True),
     ("custom", "https://api.anthropic.com.evil.example/v1", False),
     ("openrouter", "https://openrouter.ai/api/v1", False),
