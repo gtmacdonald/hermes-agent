@@ -38,6 +38,9 @@ def test_billing_body_on_400_is_payment_error_but_plain_400_is_not():
                     "Please go to Plans & Billing to upgrade or purchase credits.'}}", 400)
     assert ac._is_payment_error(depleted)
     assert not ac._is_payment_error(_Err("Error code: 400 - max_tokens: Field required", 400))
+    # Generic payment words in a validation 400 are not exhaustion.
+    assert not ac._is_payment_error(_Err("Error code: 400 - billing_address.country is required", 400))
+    assert not ac._is_payment_error(_Err("Error code: 400 - credits field must be an integer", 400))
 
 
 def test_absent_credentials_quarantine_is_debug_and_names_the_real_reason(caplog):
