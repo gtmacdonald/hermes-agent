@@ -129,6 +129,17 @@ def handle_api_error(
         reason=classified.reason.value,
     )
 
+    # Greg's spending policy: native Anthropic may use existing balance, then
+    # stop for an explicit subscription-harness handoff before any pool/fallback hop.
+    if classified.reason == FailoverReason.billing and (
+        getattr(agent, "provider", "") == "anthropic" or "api.anthropic.com" in str(getattr(agent, "base_url", "") or "")
+    ):
+        summary = "Anthropic Platform balance is depleted. This turn stopped without automatic provider fallback. Explicitly select an existing supported subscription harness to continue."
+        return _verdict("return", {"final_response": summary, "messages": messages, "api_calls": api_call_count,
+                                   "completed": False, "failed": True, "error": summary,
+                                   "failure_reason": "billing", "failure_retryable": False,
+                                   "subscription_handoff_required": True})
+
     _recovered, recovered_with_pool = recover_after_classification(
         agent, api_error, classified, _retry, status_code=status_code, error_context=error_context,
         messages=messages, api_messages=api_messages,
@@ -272,6 +283,15 @@ def settle_unrecovered_error(
             action=action, active_system_prompt=active_system_prompt, retry_count=retry_count,
             compression_attempts=compression_attempts, result=result,
         )
+
+    if classified.reason == FailoverReason.billing and (
+        _provider == "anthropic" or "api.anthropic.com" in str(_base or "")
+    ):
+        summary = "Anthropic Platform balance is depleted. This turn stopped without automatic provider fallback. Explicitly select an existing supported subscription harness to continue."
+        return _verdict("return", {"final_response": summary, "messages": messages, "api_calls": api_call_count,
+                                   "completed": False, "failed": True, "error": summary,
+                                   "failure_reason": "billing", "failure_retryable": False,
+                                   "subscription_handoff_required": True})
 
     # ``FailoverReason.billing`` (402) is deliberately NOT excluded: pool rotation and
     # eager fallback already gave up, so retrying only burns paid requests on a depleted
