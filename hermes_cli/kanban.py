@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli import kanban_db as kb
+from hermes_cli.kanban_manual_spec import cmd_accept_spec
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_dispatch as kbd
 from hermes_cli import kanban_db_workspace as kbw
@@ -209,7 +210,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
-    "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
+    "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "accept-spec", "decompose",
     "request-review", "request-changes", "reopen-review",
     "gc",
 })
@@ -1335,7 +1336,7 @@ _HANDLERS = {
     "log": _cmd_log, "runs": _cmd_runs, "heartbeat": _cmd_heartbeat,
     "assignees": _cmd_assignees, "notify-subscribe": _cmd_notify_subscribe,
     "notify-list": _cmd_notify_list, "notify-unsubscribe": _cmd_notify_unsubscribe,
-    "context": _cmd_context, "specify": _cmd_specify, "decompose": _cmd_decompose,
+    "context": _cmd_context, "specify": _cmd_specify, "accept-spec": cmd_accept_spec, "decompose": _cmd_decompose,
     "gc": _cmd_gc,
 }
 
