@@ -3250,10 +3250,10 @@ _PAYMENT_KEYWORDS = _BILLING_PATTERNS + (
 
 
 def _is_payment_error(exc: Exception) -> bool:
-    """Payment/credit/quota exhaustion: HTTP 402, or a billing/quota body on 403/404/429/no-status."""
+    """Payment/credit/quota exhaustion: HTTP 402, or a proven billing/quota body on 400/403/404/429/no-status."""
     status = getattr(exc, "status_code", None)
     return status == 402 or (
-        status in {403, 404, 429, None} and _contains_any(str(exc).lower(), _PAYMENT_KEYWORDS)
+        status in {400, 403, 404, 429, None} and _contains_any(str(exc).lower(), _PAYMENT_KEYWORDS)
     )
 
 
