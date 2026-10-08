@@ -97,9 +97,10 @@ def fast_mode_unprovisioned(api_error: Any, api_kwargs: Any) -> bool:
     if (api_kwargs.get("extra_body") or {}).get("speed") != "fast":
         return False
     headers = getattr(getattr(api_error, "response", None), "headers", None)
-    if headers is None:
-        return False
-    return any(str(headers.get(name, "")).strip() == "0" for name in _FAST_LIMIT_HEADERS)
+    if headers and any(str(headers.get(name, "")).strip() == "0" for name in _FAST_LIMIT_HEADERS):
+        return True
+    # OAuth fast mode can return this explicit capacity error without limit headers.
+    return "usage credits are required for fast mode" in str(api_error).lower()
 
 
 def mark_fast_mode_unavailable(agent: Any) -> bool:
