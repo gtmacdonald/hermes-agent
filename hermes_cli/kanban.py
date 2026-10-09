@@ -311,11 +311,22 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
+    tid, ttl = args.task_id, getattr(args, "ttl", None)
+    # A dispatcher-pinned worker keeps its own lock even if the env also names a claimer.
+    worker_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    claimer = getattr(args, "claimer", None) or (None if worker_lock else _named_claimer(args))
     with kbc.connect_closing() as conn:
-        ok = kbd.heartbeat_worker(conn, args.task_id, note=getattr(args, "note", None),
-                                 expected_run_id=_worker_run_id_for(args.task_id))
-    return _ok_or_err(ok, f"cannot heartbeat {args.task_id} (not running?)",
-                      f"Heartbeat recorded for {args.task_id}")
+        if claimer:
+            if not kb.heartbeat_claim(conn, tid, ttl_seconds=ttl, claimer=claimer):
+                return _err(f"cannot heartbeat {tid}: its claim is not held by {claimer} "
+                            f"(expired, reclaimed, or never claimed); claim it again")
+        elif worker_lock:
+            # Same as the kanban_heartbeat tool: renewal is best effort, the event is the signal.
+            kb.heartbeat_claim(conn, tid, ttl_seconds=ttl, claimer=worker_lock)
+        ok = kbd.heartbeat_worker(conn, tid, note=getattr(args, "note", None),
+                                 expected_run_id=_worker_run_id_for(tid))
+    return _ok_or_err(ok, f"cannot heartbeat {tid} (not running?)",
+                      f"Heartbeat recorded for {tid}")
 
 
 def _cmd_assignees(args: argparse.Namespace) -> int:
@@ -734,8 +745,13 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
+    claimer = _named_claimer(args)
+    if claimer:
+        problem = kb.claimer_problem(claimer)
+        if problem:
+            return _err(f"cannot claim {args.task_id}: {problem}", 2)
     with kbc.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl, claimer=claimer)
         if task is None:
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
@@ -744,7 +760,10 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                         f"lock={existing.claim_lock or '(none)'}")
         workspace = kbw.resolve_workspace(task)
         kbw.set_workspace_path(conn, task.id, str(workspace))
-    print(f"Claimed {task.id}\nWorkspace: {workspace}")
+    print(f"Claimed {task.id}\nWorkspace: {workspace}\nClaimer: {task.claim_lock}")
+    if not claimer:
+        print("note: this claim names no holder, so it cannot be renewed and does not protect the "
+              "card; pass --claimer <kind>:<id> (or set HERMES_KANBAN_CLAIMER)", file=sys.stderr)
     return 0
 
 
@@ -824,6 +843,23 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def _named_claimer(args: argparse.Namespace) -> Optional[str]:
+    """The external holder (``<kind>:<id>``) this command speaks for: ``--claimer``,
+    else ``$HERMES_KANBAN_CLAIMER``."""
+    return getattr(args, "claimer", None) or os.environ.get("HERMES_KANBAN_CLAIMER") or None
+
+
+def _owned_run_id(conn, task_id: str, claimer: Optional[str]) -> Optional[int]:
+    """The run the caller can prove it owns: a worker's pinned run, else the current run
+    when ``claimer`` holds the task's claim. complete/request_review CAS on that run id,
+    so a claim lost after this read still refuses."""
+    run_id = _worker_run_id_for(task_id)
+    if run_id is not None or not claimer:
+        return run_id
+    task = kb.get_task(conn, task_id)
+    return task.current_run_id if task and task.claim_lock == claimer else None
 
 
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
@@ -909,6 +945,7 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     if rc:
         return rc
     fail_msg: dict[str, str] = {}
+    claimer = _named_claimer(args)
     with kbc.connect_closing() as conn:
         def op(tid):
             gate_err = _goal_gate_error(
@@ -921,12 +958,18 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                        expected_run_id=_worker_run_id_for(tid),
+                                        expected_run_id=_owned_run_id(conn, tid, claimer),
                                         force=bool(getattr(args, "force", False)))
             except kb.LiveClaimError:
-                fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
-                                 f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
-                                 f"--force to close its run and complete anyway.")
+                lock = kb.get_task(conn, tid).claim_lock
+                if kb.is_named_claim(lock):
+                    fail_msg[tid] = (f"cannot complete {tid}: it is claimed by {lock}. Complete it as "
+                                     f"that holder (--claimer {lock}), `hermes kanban reclaim {tid}` to "
+                                     f"release it, or re-run with --force to complete anyway.")
+                else:
+                    fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
+                                     f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
+                                     f"--force to close its run and complete anyway.")
                 return False
             except kb.EmptyCompletionError as empty_err:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
@@ -1048,7 +1091,8 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return _err(gate_err)
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+            expected_run_id=_owned_run_id(conn, tid, _named_claimer(args)),
+            force=bool(getattr(args, "force", False)), with_reason=True)
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
         persisted_run = kb.latest_run(conn, tid)
