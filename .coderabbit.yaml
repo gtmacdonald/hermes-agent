@@ -2,10 +2,15 @@
 #
 # Upstream (NousResearch) disables auto-review because CodeRabbit carries no
 # merge weight there. This fork's workflow is one reviewed PR per change, so
-# auto-review is ON here: every PR opened against the fork gets a review.
+# auto-review is ON here for eligible PRs: non-draft PRs that target the
+# default branch (`main`). Drafts and PRs into other branches are skipped
+# unless `drafts` / `base_branches` below are extended.
 #
-# On demand: comment `@coderabbitai review` (incremental) or
-# `@coderabbitai full review` on any PR; `@coderabbitai ignore` mutes it.
+# On demand: comment `@coderabbitai review` for an incremental review, or
+# `@coderabbitai full review` to re-review every file (use it when automatic
+# review is paused or skipped, e.g. a PR into another branch). To mute
+# CodeRabbit on one PR, put `@coderabbitai ignore` in the PR description,
+# not in a comment.
 reviews:
   auto_review:
     enabled: true
