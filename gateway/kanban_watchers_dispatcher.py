@@ -257,9 +257,15 @@ class _KanbanDispatcher:
                 entries = reviewed_entries(scope, slug)
                 if not entries:
                     continue
-                with _kbc().connect(board=slug) as conn:
+                from hermes_cli import kanban_db as _kb
+                with _kb.pin_first_board_resolution():
+                    conn = _kbc().connect(board=slug)
+                try:
                     if any(eligible(conn, e) for e in entries):
                         return True
+                finally:
+                    # sqlite3's context manager commits but does not close.
+                    conn.close()
         except Exception:
             return False
         return False
