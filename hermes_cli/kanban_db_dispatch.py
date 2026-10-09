@@ -1965,6 +1965,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     reconcile_orphans: bool = True,
+    eligibility_scope=None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1975,6 +1976,12 @@ def dispatch_once(
     resolved DB path so unrelated boards tick in parallel.
     """
     def _locked_tick() -> DispatchResult:
+        if eligibility_scope is not None:
+            return _dispatch_reviewed_once(
+                conn, eligibility_scope, board=board, spawn_fn=spawn_fn, dry_run=dry_run,
+                max_spawn=max_spawn, max_in_progress=max_in_progress,
+                failure_limit=failure_limit, ttl_seconds=ttl_seconds,
+                per_profile_cap=max_in_progress_per_profile)
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
@@ -2010,6 +2017,44 @@ def dispatch_once(
     return result
 
 
+def _dispatch_reviewed_once(conn, scope, *, board, spawn_fn, dry_run, max_spawn,
+                            max_in_progress, failure_limit, ttl_seconds, per_profile_cap):
+    """Finite automatic scope: no board-wide promotion, reclaim or review dispatch.
+
+    Running workers keep their normal lifecycle. Failed attempts require a new
+    reviewed approval; this path never retries or revives parked cards.
+    """
+    from hermes_cli.kanban_dispatch_scope import reviewed_entries, eligible, other_running_readonly
+    result = DispatchResult()
+    entries = reviewed_entries(scope, board)
+    if not entries:
+        return result
+    other_running = other_running_readonly(_kb, board)
+    if other_running is None:
+        return result
+    may_spawn, budget = _tick_spawn_budget(conn, result, max_spawn=max_spawn,
+                                         max_in_progress=max_in_progress, board=board,
+                                         other_board_running=other_running)
+    if not may_spawn:
+        return result
+    running = {r["assignee"]: r["n"] for r in conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks WHERE status='running' GROUP BY assignee")}
+    used = 0
+    for entry in entries:
+        if budget is not None and used >= budget:
+            break
+        if not eligible(conn, entry):
+            continue
+        row = conn.execute("SELECT id, assignee FROM tasks WHERE id=?", (entry["task_id"],)).fetchone()
+        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="ready",
+                               dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
+                               failure_limit=failure_limit, spawn_fn=spawn_fn,
+                               per_profile_cap=per_profile_cap, per_profile_running=running,
+                               eligibility_guard=lambda c, e=entry: eligible(c, e)):
+            used += 1
+    return result
+
+
 def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
     """Back-compat: older spawn_fn signatures (and test stubs) accept only
     ``(task, workspace)``; pass ``board`` only when the callable supports it."""
@@ -2037,6 +2082,7 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    eligibility_guard=None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2097,7 +2143,10 @@ def _dispatch_lane_task(
         _count_spawn(assignee)
         return True
     claim = _kb.claim_review_task if lane == "review" else _kb.claim_task
-    claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
+    claim_kwargs = {"ttl_seconds": ttl_seconds}
+    if eligibility_guard is not None:
+        claim_kwargs["eligibility_guard"] = eligibility_guard
+    claimed = claim(conn, task_id, **claim_kwargs)
     if claimed is None:
         return False
     try:
@@ -2213,6 +2262,7 @@ def _tick_spawn_budget(
     max_spawn: Optional[int],
     max_in_progress: Optional[int],
     board: Optional[str],
+    other_board_running: Optional[int] = None,
 ) -> tuple[bool, Optional[int]]:
     """``(may_spawn, spawn_budget)`` for this tick; ``budget None`` = uncapped.
 
@@ -2237,7 +2287,8 @@ def _tick_spawn_budget(
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
-        total_running = running_count + count_running_tasks_other_boards(board)
+        total_running = running_count + (count_running_tasks_other_boards(board)
+                                         if other_board_running is None else other_board_running)
         if total_running >= max_in_progress:
             return False, None
         remaining = max_in_progress - total_running
@@ -2891,6 +2942,19 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         # A multiplexer dispatching for another profile must not hand it the launch
         # profile's .env settings / TERMINAL_* policy — a standalone dispatcher never would.
         strip_launch_profile_env(env, profile_home)
+    # A direct private LAN provider is pinned for this worker and its auxiliary calls.
+    if profile_home and task.provider_override and task.model_override:
+        import hermes_yaml as yaml
+        from hermes_cli.kanban_ready_cycle import approvals
+        cfg = yaml.safe_load((Path(profile_home) / "config.yaml").read_text()) or {}
+        route = cfg.get("providers", {}).get(task.provider_override, {})
+        endpoint = route.get("base_url", "")
+        probe = dict(board="worker", task_id=task.id, spec_sha256="probe", approved=True,
+                     expires_at=time.time()+60, provider=task.provider_override, model=task.model_override, endpoint=endpoint)
+        if approvals({"dispatch_ready_scope": [probe]}):
+            env["HERMES_KANBAN_LOCAL_PROVIDER"] = task.provider_override
+            env["HERMES_KANBAN_LOCAL_MODEL"] = task.model_override
+            env["HERMES_KANBAN_LOCAL_ENDPOINT"] = endpoint
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
