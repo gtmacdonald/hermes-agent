@@ -70,7 +70,7 @@ def eligible(conn, entry):
         return False
     comments = conn.execute("SELECT body FROM task_comments WHERE task_id=?",
                             (entry["task_id"],)).fetchall()
-    return any(c["body"].startswith("card-model (D-265):") and
+    return any((c["body"] or "").startswith("card-model (D-265):") and
                hashlib.sha256(c["body"].encode()).hexdigest() == entry["judge_sha256"]
                for c in comments)
 

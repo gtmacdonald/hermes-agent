@@ -2053,6 +2053,8 @@ def _dispatch_reviewed_once(conn, scope, *, board, spawn_fn, dry_run, max_spawn,
         if not eligible(conn, entry):
             continue
         row = conn.execute("SELECT id, assignee FROM tasks WHERE id=?", (entry["task_id"],)).fetchone()
+        if row is None:  # deleted between the eligibility read and this one
+            continue
         if _dispatch_lane_task(conn, row, row["assignee"], result, lane="ready",
                                dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
                                failure_limit=failure_limit, spawn_fn=spawn_fn,
