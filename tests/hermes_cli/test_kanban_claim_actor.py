@@ -169,6 +169,35 @@ def test_comment_author_without_claimer_is_the_profile(kanban_home):
     assert _comments(tid)[-1].author == kc._profile_author()
 
 
+def test_block_reason_comment_author_matches_the_blocked_actor(kanban_home, monkeypatch):
+    tid = _ready_task()
+    monkeypatch.setenv("HERMES_KANBAN_CLAIMER", OWNER)
+    out = kc.run_slash(f"block {tid} waiting on Greg")
+    assert "Blocked" in out, out
+    comment = _comments(tid)[-1]
+    assert comment.body == "BLOCKED: waiting on Greg"
+    assert comment.author == OWNER == _last_event(tid, "blocked").payload["actor"]
+
+
+def test_schedule_reason_comment_author_is_the_claimer(kanban_home, monkeypatch):
+    tid = _ready_task()
+    monkeypatch.setenv("HERMES_KANBAN_CLAIMER", OWNER)
+    out = kc.run_slash(f"schedule {tid} after the Monday release")
+    assert "Scheduled" in out, out
+    comment = _comments(tid)[-1]
+    assert comment.body == "SCHEDULED: after the Monday release"
+    assert comment.author == OWNER
+
+
+@pytest.mark.parametrize("verb, prefix", [("block", "BLOCKED"), ("schedule", "SCHEDULED")])
+def test_block_and_schedule_comment_author_without_claimer_is_the_profile(kanban_home, verb, prefix):
+    tid = _ready_task()
+    kc.run_slash(f"{verb} {tid} plain reason")
+    comment = _comments(tid)[-1]
+    assert comment.body == f"{prefix}: plain reason"
+    assert comment.author == kc._profile_author()
+
+
 # ---------------------------------------------------------------------------
 # complete --force --reason
 # ---------------------------------------------------------------------------

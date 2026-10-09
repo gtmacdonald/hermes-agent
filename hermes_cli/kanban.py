@@ -206,6 +206,13 @@ def _profile_author() -> str:
     return current_profile_name("user") or "user"
 
 
+def _comment_author(args: argparse.Namespace) -> str:
+    """Author of a comment a verb writes: ``--author`` when the verb has it, else the
+    external harness's claimer (``--claimer`` / ``$HERMES_KANBAN_CLAIMER``, so it matches
+    the event ``actor``), else the profile."""
+    return getattr(args, "author", None) or _named_claimer(args) or _profile_author()
+
+
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
@@ -798,7 +805,7 @@ def _cmd_comment(args: argparse.Namespace) -> int:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
     # An external harness that set its claimer speaks as that claimer, not as the profile.
-    author = args.author or _named_claimer(args) or _profile_author()
+    author = _comment_author(args)
     with kbc.connect_closing() as conn:
         kb.add_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
@@ -1064,7 +1071,7 @@ def _commented(conn, reason: Optional[str], author, prefix: str, op):
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
-    author = _profile_author()
+    author = _comment_author(args)
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
@@ -1090,7 +1097,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
-    author = _profile_author()
+    author = _comment_author(args)
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
     with kbc.connect_closing() as conn:
