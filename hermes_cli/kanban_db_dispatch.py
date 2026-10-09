@@ -1110,8 +1110,9 @@ def _classify_dead_worker_exit(
         # ``_account_crashes`` trips the breaker now instead of after ``failure_limit``.
         return _DeadWorker(
             kind, code,
-            f"pid {pid} exited on a terminal provider error (exit {code}): the provider rejected "
-            "this profile's credential or model — fix the configuration, then unblock.",
+            f"pid {pid} exited on a terminal provider or worker-policy error (exit {code}): "
+            "credentials/model were rejected or required lifecycle tools are unavailable; "
+            "see the worker log, fix the configuration, then unblock.",
             "crashed",
             {"pid": pid, "claimer": claimer, "exit_kind": kind, "exit_code": code, "terminal_provider": True},
             terminal_provider=True,
@@ -2740,8 +2741,8 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
-    """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
+def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str], *, query_file: str) -> list[str]:
+    """Build the normal worker command with a private full-spec query file."""
     cmd = [
         *_resolve_hermes_argv(),
         "-p", profile_arg,
@@ -2771,8 +2772,8 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
-    cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
-    # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
+    cmd.extend(["chat", "--query-file", query_file])
+    # query-file feeds the same one-shot path: cli.py runs the judge loop too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd
 
@@ -2787,7 +2788,14 @@ def _open_worker_log(task: Task, board: Optional[str]):
     log_path = log_dir / f"{task.id}.log"
     rotate_bytes, backup_count = worker_log_rotation_config()
     _rotate_worker_log(log_path, rotate_bytes, backup_count)
-    return open(log_path, "ab")
+    log_f = open(log_path, "ab")
+    try:
+        if not _kb._IS_WINDOWS:
+            os.fchmod(log_f.fileno(), 0o600)
+    except BaseException:
+        log_f.close()
+        raise
+    return log_f
 
 
 def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
@@ -2937,34 +2945,46 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
-    # The module argv must carry the import context that made it resolvable:
-    # the shim's in-process path injection is invisible to the bare child.
-    _propagate_module_import_root(cmd, env)
-    # A worker spawned by a managed systemd gateway must leave the gateway's
-    # cgroup before startup; otherwise restarting the service kills the worker
-    # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
-    from tools.process_registry import systemd_user_bus_env
-    env = systemd_user_bus_env(env)
-    log_f = _open_worker_log(task, board)
+    from hermes_cli.kanban_worker_bootstrap import write_worker_query
+    query_file = write_worker_query(task, workspace, env["HERMES_KANBAN_BOARD"],
+                                    _kb.worker_logs_dir(board=board))
+    spawned = False
     try:
-        proc = subprocess.Popen(
-            cmd,
-            cwd=workspace if os.path.isdir(workspace) else None,
-            stdin=subprocess.DEVNULL,
-            stdout=log_f,
-            stderr=subprocess.STDOUT,
-            env=env,
-            start_new_session=True,
-            creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
-        )
-    except FileNotFoundError:
-        log_f.close()
-        raise RuntimeError(
-            "`hermes` executable not found on PATH. "
-            "Install Hermes Agent or activate its venv before running the kanban dispatcher."
-        )
+        cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"), query_file=str(query_file))
+        # The module argv must carry the import context that made it resolvable:
+        # the shim's in-process path injection is invisible to the bare child.
+        _propagate_module_import_root(cmd, env)
+        # A worker spawned by a managed systemd gateway must leave the gateway's
+        # cgroup before startup; otherwise restarting the service kills the worker
+        # that is performing the handoff.
+        cmd = _restart_safe_worker_argv(task, cmd)
+        from tools.process_registry import systemd_user_bus_env
+        env = systemd_user_bus_env(env)
+        log_f = _open_worker_log(task, board)
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=workspace if os.path.isdir(workspace) else None,
+                stdin=subprocess.DEVNULL,
+                stdout=log_f,
+                stderr=subprocess.STDOUT,
+                env=env,
+                start_new_session=True,
+                creationflags=subprocess.CREATE_NO_WINDOW if _kb._IS_WINDOWS else 0,
+            )
+        except FileNotFoundError:
+            log_f.close()
+            raise RuntimeError(
+                "`hermes` executable not found on PATH. "
+                "Install Hermes Agent or activate its venv before running the kanban dispatcher."
+            )
+        except BaseException:
+            log_f.close()
+            raise
+        spawned = True
+    finally:
+        if not spawned:
+            query_file.unlink(missing_ok=True)
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
     if _kb._IS_WINDOWS:

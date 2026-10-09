@@ -745,6 +745,13 @@ class CLIAgentSetupMixin:
             from hermes_constants import partial_update_hint
             for line in partial_update_hint(e):
                 console.print(line)
+            from hermes_cli.kanban_worker_bootstrap import KanbanWorkerToolPolicyError
+            if isinstance(e, KanbanWorkerToolPolicyError):
+                # Existing EX_CONFIG stops terminal setup errors on the first attempt.
+                # Do not silently retry, grant disabled tools, or fall back to another route.
+                from hermes_cli.kanban_db import KANBAN_TERMINAL_PROVIDER_EXIT_CODE
+                from hermes_cli.quiet_single_query import exit_single_query
+                exit_single_query(KANBAN_TERMINAL_PROVIDER_EXIT_CODE)
             return False
 
     def _resume_history_limit_error(self, tip_only: bool = False):
