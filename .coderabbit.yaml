@@ -1,18 +1,11 @@
-# CodeRabbit configuration.
+# CodeRabbit configuration (gtmacdonald fork).
 #
-# Auto-review is DISABLED repo-wide: the app was enabled at the org level on
-# 2026-08-14 and immediately began reviewing every opened PR. This repo's
-# merge gate is CI ("All required checks pass (v2)") plus maintainer review —
-# CodeRabbit reviews carry no merge weight (protect-main ruleset requires
-# 0 approving reviews), so auto-firing on the full PR firehose adds comment
-# noise without gating value.
+# Upstream (NousResearch) disables auto-review because CodeRabbit carries no
+# merge weight there. This fork's workflow is one reviewed PR per change, so
+# auto-review is ON here: every PR opened against the fork gets a review.
 #
-# The bot stays installed and summonable on demand: comment
-# `@coderabbitai review` on any PR to request a one-off review, or
-# `@coderabbitai ignore` to mute it on a PR it has already joined.
-#
-# To re-enable auto-review, flip `enabled: true` below (or delete this file —
-# the app default is on).
+# On demand: comment `@coderabbitai review` (incremental) or
+# `@coderabbitai full review` on any PR; `@coderabbitai ignore` mutes it.
 reviews:
   auto_review:
-    enabled: false
+    enabled: true
