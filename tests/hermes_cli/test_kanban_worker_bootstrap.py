@@ -65,3 +65,18 @@ def test_aux_route_is_restricted_to_the_reviewed_endpoint(local_worker):
         wb.restrict_auxiliary_route("openrouter", None, None)
     with pytest.raises(wb.KanbanWorkerToolPolicyError):
         wb.restrict_auxiliary_route("lan", None, "https://openrouter.ai/api/v1")
+
+
+def test_aux_route_normalizes_provider_spelling(local_worker):
+    endpoint = LOCAL["HERMES_KANBAN_LOCAL_ENDPOINT"]
+    for provider in (None, " LAN ", "Auto"):
+        assert wb.restrict_auxiliary_route(provider, None, None) == ("lan", "qwen-local", endpoint)
+
+
+@pytest.mark.parametrize("missing", ["HERMES_KANBAN_LOCAL_MODEL", "HERMES_KANBAN_LOCAL_ENDPOINT"])
+def test_partial_local_pin_fails_closed_with_a_policy_error(local_worker, monkeypatch, missing):
+    monkeypatch.delenv(missing)
+    with pytest.raises(wb.KanbanWorkerToolPolicyError, match="missing"):
+        wb.local_worker_overlay({})
+    with pytest.raises(wb.KanbanWorkerToolPolicyError, match="missing"):
+        wb.restrict_auxiliary_route("auto", None, None)
