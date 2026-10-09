@@ -587,6 +587,22 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
     return
 
 
+
+@pytest.fixture(autouse=True)
+def _neutralize_spend_policy(request, monkeypatch):
+    """The fork-local spend guard fails closed without ``~/.config/model-spend-policy.json`` and
+    expects real SDK clients; provider tests use fakes and unlisted models. Tests of the guard
+    itself opt out with ``@pytest.mark.real_spend_policy``."""
+    if request.node.get_closest_marker("real_spend_policy"):
+        return
+    try:
+        _mod = importlib.import_module("agent.spend_policy")
+    except Exception:
+        return
+    # No metered lane -> prepare() passes bodies through and the HTTP hook is a no-op.
+    monkeypatch.setattr(_mod, "lane", lambda _url: None)
+    monkeypatch.setattr(_mod, "guard_client", lambda client, **_kwargs: client)
+
 # ── Kanban write guard (#69283) ─────────────────────────────────────────────
 # When hermetic isolation is bypassed (stale checkout, wrong rootdir, direct
 # invocation), kanban writes silently pollute the real ~/.hermes. This autouse
