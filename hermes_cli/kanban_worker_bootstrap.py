@@ -49,16 +49,29 @@ def worker_fallback_chain(chain):
     return [] if os.environ.get("HERMES_KANBAN_TASK", "").strip() else chain
 
 
+def _local_route():
+    """The dispatcher-pinned LAN route of a local-only owned worker, else None.
+
+    A partial pin fails closed: a local-only worker must never fall back to hosted routes."""
+    if not os.environ.get("HERMES_KANBAN_TASK") or not os.environ.get("HERMES_KANBAN_LOCAL_PROVIDER"):
+        return None
+    model = os.environ.get("HERMES_KANBAN_LOCAL_MODEL", "").strip()
+    endpoint = os.environ.get("HERMES_KANBAN_LOCAL_ENDPOINT", "").strip()
+    if not model or not endpoint:
+        raise KanbanWorkerToolPolicyError(
+            "local-only worker is missing HERMES_KANBAN_LOCAL_MODEL or HERMES_KANBAN_LOCAL_ENDPOINT")
+    return {"provider": os.environ["HERMES_KANBAN_LOCAL_PROVIDER"].strip(), "model": model, "endpoint": endpoint}
+
+
 def local_worker_overlay(config):
     """Ephemeral local-only route for owned workers; never alters cached/on-disk config."""
-    if not os.environ.get("HERMES_KANBAN_TASK") or not os.environ.get("HERMES_KANBAN_LOCAL_PROVIDER"):
+    local = _local_route()
+    if local is None:
         return config
     import copy
     config = copy.deepcopy(config)
-    route = dict(provider=os.environ["HERMES_KANBAN_LOCAL_PROVIDER"],
-                 model=os.environ["HERMES_KANBAN_LOCAL_MODEL"],
-                 base_url=os.environ["HERMES_KANBAN_LOCAL_ENDPOINT"], api_mode="chat_completions",
-                 fallback_chain=[])
+    route = dict(provider=local["provider"], model=local["model"], base_url=local["endpoint"],
+                 api_mode="chat_completions", fallback_chain=[])
     auxiliary = config.setdefault("auxiliary", {})
     auxiliary.update(route)
     for key, value in list(auxiliary.items()):
@@ -84,10 +97,12 @@ def local_worker_overlay(config):
 
 def restrict_auxiliary_route(provider, model, base_url):
     """Fail before opening any hosted client in a local-only worker."""
-    if not os.environ.get("HERMES_KANBAN_TASK") or not os.environ.get("HERMES_KANBAN_LOCAL_PROVIDER"):
+    local = _local_route()
+    if local is None:
         return provider, model, base_url
-    local = os.environ["HERMES_KANBAN_LOCAL_PROVIDER"]
-    endpoint = os.environ["HERMES_KANBAN_LOCAL_ENDPOINT"]
-    if provider not in {local, "auto", ""} or (base_url and base_url.rstrip("/") != endpoint.rstrip("/")):
+    requested = (provider or "").strip().lower()
+    endpoint = local["endpoint"]
+    if requested not in {local["provider"].lower(), "auto", ""} or (
+            base_url and base_url.strip().rstrip("/") != endpoint.rstrip("/")):
         raise KanbanWorkerToolPolicyError("local-only worker refused an auxiliary route outside its reviewed LAN endpoint")
-    return local, os.environ["HERMES_KANBAN_LOCAL_MODEL"], endpoint
+    return local["provider"], local["model"], endpoint
