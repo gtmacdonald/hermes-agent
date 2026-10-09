@@ -278,9 +278,11 @@ _SPECS = [
     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
     _cmd("claim", [
         _TASK_ID,
-        _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),
+        _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
+             help="Claim TTL in seconds (default: 900). A turn-based harness cannot heartbeat "
+                  "while idle, so size it to the whole job (e.g. 14400)"),
         _CLAIMER,
-    ], help="Atomically claim a ready task (prints resolved workspace path)"),
+    ], help="Atomically claim a ready task (prints resolved workspace path); renew with heartbeat"),
     _cmd("comment", [
         _TASK_ID,
         _arg("text", nargs="+", help="Comment body"),
@@ -306,9 +308,11 @@ _SPECS = [
                   '"tests_run": 12}\'). Stored on the closing run.'),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
-                  "even without owning its run (closes the worker's run)."),
+                  "even without owning its run (closes the worker's run). Pair it with --reason."),
+        _arg("--reason", help="Why --force overrides the claim; recorded as forced_reason on the "
+                              "completed event (--force without it warns)"),
         _CLAIMER,
-    ], help="Mark one or more tasks done"),
+    ], help="Mark one or more tasks done; a card someone else holds needs --force --reason"),
     _cmd("edit", [
         _TASK_ID,
         _arg("--title", help="Replace the task title"),

@@ -15,6 +15,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from typing import Optional
@@ -58,6 +59,66 @@ def _claim_is_live(trow) -> bool:
         return _kb._worker_alive(trow["worker_pid"], trow["worker_started_at"])
     expires = _kb._row_get(trow, "claim_expires")
     return is_named_claim(trow["claim_lock"]) and expires is not None and int(expires) > time.time()
+
+
+class LiveClaimError(ValueError):
+    """``complete_task`` refused: the task is ``running`` under a live claim and
+    the caller neither owns its run (``expected_run_id``) nor passed ``force``.
+    Completing anyway would close the worker's run row underneath a process
+    that is still executing. ``holder`` is the ``claim_lock`` that refused, so a
+    refusal can name a named claim's holder. A ``ValueError`` so tool error
+    handlers treat it as recoverable."""
+
+    def __init__(self, task_id: str, holder: Optional[str] = None):
+        self.holder = holder
+        if is_named_claim(holder):
+            message = (
+                f"{task_id} is claimed by {holder} until its lease expires; complete it as "
+                f"that holder (claimer={holder}) or with force=True and a reason (explicit "
+                "operator override)"
+            )
+        else:
+            message = (
+                f"{task_id} is running under a live worker claim; pass expected_run_id "
+                "(worker ownership) or force=True (explicit operator override) instead "
+                "of closing the live run"
+            )
+        super().__init__(message)
+
+
+# --- Actor: who did it ---------------------------------------------------------
+# Lifecycle events name who acted. The actor lives in the JSON payload (no schema
+# change); an emitter that already knows it (``created_by``, ``--claimer``) sets it first.
+_ACTOR_EVENT_KINDS = frozenset({"claimed", "heartbeat", "completed", "reclaimed", "blocked"})
+
+
+def resolve_actor(explicit: Optional[str] = None) -> str:
+    """Who is acting on the board: an explicit claimer (``--claimer``), then a dispatched
+    worker's own lock (``$HERMES_KANBAN_CLAIM_LOCK``), then an external harness's
+    ``$HERMES_KANBAN_CLAIMER``, then this process's ``host:pid`` -- the claim fence's order."""
+    # Per-session identity, not configuration (same class as kanban._named_claimer).
+    worker_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")  # health: allow HX002 -- per-session holder identity
+    env_claimer = os.environ.get("HERMES_KANBAN_CLAIMER")  # health: allow HX002 -- per-session holder identity
+    return explicit or worker_lock or env_claimer or _kb._claimer_id()
+
+
+def _with_actor(kind: str, payload: Optional[dict]) -> Optional[dict]:
+    """``payload`` with an ``actor`` for the lifecycle kinds in :data:`_ACTOR_EVENT_KINDS`,
+    unless it already names one; other kinds pass through unchanged."""
+    if kind not in _ACTOR_EVENT_KINDS or (payload and payload.get("actor")):
+        return payload
+    return {**(payload or {}), "actor": resolve_actor()}
+
+
+def _completed_actor_payload(
+    payload: dict, *, actor: Optional[str], force: bool, force_reason: Optional[str],
+) -> dict:
+    """The ``completed`` event names its actor; a forced completion also records
+    ``forced`` and the operator's ``forced_reason`` (None when ``--force`` came bare)."""
+    payload = {**payload, "actor": resolve_actor(actor)}
+    if force:
+        payload.update(forced=True, forced_reason=force_reason)
+    return payload
 
 
 # Late-bound origin namespace (see module docstring); imported LAST so this
