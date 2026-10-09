@@ -1110,7 +1110,7 @@ def _classify_dead_worker_exit(
         # ``_account_crashes`` trips the breaker now instead of after ``failure_limit``.
         return _DeadWorker(
             kind, code,
-            f"pid {pid} exited on a terminal provider or worker-policy error (exit {code}): "
+            f"pid {pid} exited on a terminal provider error or worker tool-policy error (exit {code}): "
             "credentials/model were rejected or required lifecycle tools are unavailable; "
             "see the worker log, fix the configuration, then unblock.",
             "crashed",

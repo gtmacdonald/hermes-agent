@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 
 def _make_task(kb, *, assignee: str):
@@ -133,7 +134,10 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"
-    assert args.query == "work kanban task t_spawn_tools"
+    # The full spec travels in a private query file, not argv (fork-local worker isolation).
+    assert args.query is None
+    handoff = Path(args.query_file)
+    assert handoff.parent == kb.worker_logs_dir() and "t_spawn_tools" in handoff.read_text()
 
 
 def test_default_spawn_resolves_env_passthrough_under_multiplex(monkeypatch, tmp_path):
