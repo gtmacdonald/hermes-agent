@@ -94,3 +94,26 @@ def _ready(**overrides):
 ])
 def test_ready_cycle_admits_only_direct_private_lan_routes(overrides, admitted):
     assert bool(approvals(_ready(**overrides))) is admitted
+
+
+def test_reviewed_tick_reclaims_running_workers_without_promoting(board, monkeypatch):
+    from hermes_cli import kanban_db_dispatch as kbd
+    calls = []
+    real = kbd._run_reclaim_phase
+    monkeypatch.setattr(kbd, "_run_reclaim_phase",
+                        lambda *a, **k: calls.append(k) or real(*a, **k))
+    with kbc.connect_closing(board=board) as conn:
+        todo = kb.create_task(conn, title="Parent-free, unreviewed")
+        conn.execute("UPDATE tasks SET status='todo' WHERE id=?", (todo,))
+        kbd.dispatch_once(conn, board=board, eligibility_scope=[], spawn_fn=lambda *a, **k: None)
+        assert conn.execute("SELECT status FROM tasks WHERE id=?", (todo,)).fetchone()[0] == "todo"
+    assert len(calls) == 1 and calls[0]["promote"] is False
+
+
+def test_boards_with_running_work_are_found_read_only(board):
+    from hermes_cli.kanban_dispatch_scope import boards_with_running_readonly
+    kb.create_board("idle")
+    with kbc.connect_closing(board=board) as conn:
+        task_id = kb.create_task(conn, title="In flight")
+        conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
+    assert boards_with_running_readonly(kb) == {board}

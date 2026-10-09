@@ -146,12 +146,13 @@ class _KanbanDispatcher:
             return []
 
     def _board_slugs(self) -> list:
-        # Do not even open/migrate unrelated board databases during scoped dispatch.
-        from hermes_cli.config import load_config
-        from hermes_cli.kanban_dispatch_scope import reviewed_entries
+        # Do not even open/migrate unrelated board databases during scoped dispatch; boards
+        # with running workers still tick so the reclaim sweeps keep their lifecycle.
+        from hermes_cli.kanban_dispatch_scope import boards_with_running_readonly, reviewed_entries
         try:
             scope = self._scope()
-            return [slug for slug in _board_slugs(self.kb) if reviewed_entries(scope, slug)]
+            running = boards_with_running_readonly(self.kb)
+            return [slug for slug in _board_slugs(self.kb) if reviewed_entries(scope, slug) or slug in running]
         except Exception:
             return []
 
