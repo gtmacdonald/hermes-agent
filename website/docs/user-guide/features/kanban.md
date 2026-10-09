@@ -964,11 +964,11 @@ hermes kanban schedule <id> --at <ISO8601>             # set/clear a task's sche
 hermes kanban diagnostics [--json]                     # board health snapshot (alias: diag)
 hermes kanban link <parent_id> <child_id>
 hermes kanban unlink <parent_id> <child_id>
-hermes kanban claim <id> [--ttl SECONDS]
-hermes kanban comment <id> "<text>" [--author NAME]
+hermes kanban claim <id> [--ttl SECONDS] [--claimer KIND:ID]   # see "Claiming from another harness"
+hermes kanban comment <id> "<text>" [--author NAME]   # author defaults to $HERMES_KANBAN_CLAIMER, then the profile
 
 # Bulk verbs — accept multiple ids:
-hermes kanban complete <id>... [--result "..."] [--force]
+hermes kanban complete <id>... [--result "..."] [--claimer KIND:ID] [--force --reason "..."]
 hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
@@ -981,6 +981,7 @@ hermes kanban tail <id>                                # follow a single task's 
 hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events to the terminal
         [--kinds completed,blocked,…] [--interval SECS]
 hermes kanban heartbeat <id> [--note "..."]            # worker liveness signal for long ops
+        [--claimer KIND:ID] [--ttl SECONDS]            # holder of a named claim: also renews it
 hermes kanban runs <id> [--json]                       # attempt history (one row per run)
 hermes kanban assignees [--json]                       # profiles on disk + per-assignee task counts
 hermes kanban dispatch [--dry-run] [--max N]           # one-shot pass
@@ -1005,6 +1006,40 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
+
+### Claiming from another harness
+
+A session outside Hermes (Claude Code, Codex, Muse, a script) claims a card under a
+**named claim**, `<kind>:<id>`, for example `claude:905f3fd6` or `codex:01a10973`:
+
+```bash
+export HERMES_KANBAN_CLAIMER=claude:905f3fd6        # or pass --claimer on each command
+hermes kanban claim t_1234 --ttl 14400              # job-sized lease, see the gap below
+hermes kanban heartbeat t_1234                      # renews: claim_expires = max(current, now + TTL)
+hermes kanban comment t_1234 "picked this up"       # author: claude:905f3fd6
+hermes kanban complete t_1234 --result "shipped"    # only the holder completes without --force
+```
+
+- **Identity.** The claimer is `--claimer`, then a dispatched worker's own
+  `HERMES_KANBAN_CLAIM_LOCK`, then `HERMES_KANBAN_CLAIMER`. With none, the claim is
+  `host:pid` of the CLI process, which exits at once: such a claim cannot be renewed and
+  protects nothing.
+- **Renewal.** `heartbeat` by the holder extends `claim_expires` to now plus `--ttl`
+  (default 900 s) and never shortens a longer claim. A heartbeat by anyone else only
+  records the event. Without renewal the dispatcher's stale sweep reclaims the card at
+  expiry and counts a failure.
+- **Fence.** While a named claim is live, `complete` and `request-review` from anyone
+  else are refused with the holder's name. An operator overrides with
+  `complete --force --reason "..."`; the reason is stored as `forced_reason` on the
+  `completed` event. `--force` without `--reason` still works but warns.
+- **Actor.** `claimed`, `heartbeat`, `completed`, `reclaimed` and `blocked` events carry
+  an `actor` in their payload, resolved the same way (falling back to `host:pid`).
+
+**Known gap: idle turn-based harnesses do not heartbeat.** A Claude Code or Codex
+session runs commands only while it has a turn, so it cannot renew a claim while it
+waits for its next prompt. Until a hook or mod renews claims between turns, claim with a
+`--ttl` that covers the whole job (for example `--ttl 14400` for four hours) and
+heartbeat at each work transition.
 
 ### Concurrency, scheduling, and child promotion config
 
@@ -1385,7 +1420,7 @@ Runs are exposed on the dashboard (Run History section in the drawer, one colour
 
 **Dependency refusal on complete names the parents.** `kanban_complete` / `hermes kanban complete` / the dashboard's "mark done" and "request review" actions (single and bulk) on a card whose direct parent is not `done`/`archived` (a parent reopened mid-run, or an edge that predates the running-child refusal) reports `unsatisfied parent dependencies: t_… (todo)` instead of the generic "unknown id, stale run, or already terminal" text; the card stays in-flight. `kanban_show` lists the same parents under `unsatisfied_parents`, and `hermes kanban show` / `hermes kanban diagnostics` / the dashboard raise a `running_with_open_parents` warning on a running card in that state. Finish the parent or `hermes kanban unlink <parent> <child>`; there is no force path through the dependency gate.
 
-**Live-claim guard on complete.** A `running` task whose worker holds a live claim is only completed by that worker (`kanban_complete` from inside the run) or by an explicit operator override: `hermes kanban complete <id> --force` and the dashboard's "mark done" action. A claim-less `hermes kanban complete <id>` or an orchestrator session's `kanban_complete` is refused with a pointer to `--force` / `hermes kanban reclaim`, so a second session can no longer close a live worker's run underneath it. Completing `ready`, `blocked` or `review` cards without a claim is unchanged.
+**Live-claim guard on complete.** A `running` task whose worker holds a live claim is only completed by that worker (`kanban_complete` from inside the run) or by an explicit operator override: `hermes kanban complete <id> --force --reason "..."` and the dashboard's "mark done" action. A named claim (see [Claiming from another harness](#claiming-from-another-harness)) fences the same way until its lease expires, and the refusal names its holder. A claim-less `hermes kanban complete <id>` or an orchestrator session's `kanban_complete` is refused with a pointer to `--force` / `hermes kanban reclaim`, so a second session can no longer close a live worker's run underneath it. Completing `ready`, `blocked` or `review` cards without a claim is unchanged.
 
 **Reclaimed runs from status changes.** If you drag a running task off `running` in the dashboard (back to `ready`, or straight to `todo`), or archive a task that was still running, the in-flight run closes with `outcome='reclaimed'` rather than being orphaned. The `task_runs` row is always in a terminal state when `tasks.current_run_id` is `NULL`, and vice versa — that invariant holds across CLI, dashboard, dispatcher, and notifier.
 
@@ -1407,9 +1442,9 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 |---|---|---|
 | `created` | `{assignee, status, parents, tenant}` | Task inserted. `run_id` is `NULL`. |
 | `promoted` | — | `todo → ready` because all parents hit `done`. `run_id` is `NULL`. |
-| `claimed` | `{lock, expires, run_id}` | Dispatcher atomically claimed a `ready` task for spawn. |
-| `completed` | `{result_len, summary?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
-| `blocked` | `{reason, kind, recurrences}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. A `kind=dependency` block with no incomplete parent lands here as `needs_input` (payload adds `requested_kind: dependency`, `rekind_reason: no_open_parent`) because `todo` would only get it re-promoted and respawned on the next dispatch tick. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
+| `claimed` | `{lock, expires, run_id, actor}` | Dispatcher atomically claimed a `ready` task for spawn. |
+| `completed` | `{result_len, summary?, actor, forced?, forced_reason?}` | Worker wrote `--result` / `--summary` and task hit `done`. `summary` is the first-line handoff (400-char cap); full version lives on the run row. If `complete_task` is called on a never-claimed task with handoff fields, a zero-duration run is synthesized so `run_id` still points at something. |
+| `blocked` | `{reason, kind, recurrences, actor}` | Worker or human flipped the task to `blocked`. `kind` is the typed block reason (`needs_input`, `capability`, `transient`, or `null` for a generic block); `recurrences` is the unblock-loop counter. A `kind=dependency` block with no incomplete parent lands here as `needs_input` (payload adds `requested_kind: dependency`, `rekind_reason: no_open_parent`) because `todo` would only get it re-promoted and respawned on the next dispatch tick. Synthesizes a zero-duration run when called on a never-claimed task with `--reason`. |
 | `dependency_wait` | `{reason, kind}` or `{reason: parent_not_done, demoted: true, parent}` | Worker blocked with `kind=dependency` while at least one parent is still open — the task is only waiting on another task, so it routes to `todo` (parent-gated, auto-promoted) instead of `blocked` and no recurrence is counted. No human needed. Also emitted when `link`/`kanban_link` puts a `ready` child under a parent that is not `done`: the child drops back to `todo` and this event records why (the `ready → running` claim re-checks parents, so nothing can run it until the parent completes or the link is removed with `hermes kanban unlink`). |
 | `block_loop_detected` | `{reason, kind, recurrences, limit}` | A task was unblocked and re-blocked for the same reason `BLOCK_RECURRENCE_LIMIT` times (default 2). Instead of landing in `blocked` again — where a cron would keep unblocking it — it routes to `triage` for orchestration attention, breaking the unblock↔re-block loop. |
 | `unblocked` | — | `blocked → ready` (or `todo` if parents are still open), either manually or via `/unblock`. Resets the dispatcher's `consecutive_failures` but deliberately preserves `block_recurrences` so the loop breaker keeps its memory. `run_id` is `NULL`. |
@@ -1430,8 +1465,8 @@ Every transition appends a row to `task_events`. Each row carries an optional `r
 |---|---|---|
 | `spawned` | `{pid}` | Dispatcher successfully started a worker process. |
 | `worker_registered` | `{pid, started_at}` | The dispatcher died after starting the worker but before recording its pid, so the worker recorded it itself before its first model call. Liveness checks then see it and an expired claim is extended instead of spawning a second worker. A worker whose run was reclaimed before it got that far exits without working the card. |
-| `heartbeat` | `{note?}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
-| `reclaimed` | `{stale_lock}` | Claim TTL expired without a completion; task goes back to `ready`. An automatic reclaim counts as one non-successful attempt toward the `gave_up` breaker (a claim that never spawned a worker would otherwise loop claim → reclaim → claim forever); an operator `reclaim` resets the counter instead. |
+| `heartbeat` | `{note?, actor}` | Worker called `hermes kanban heartbeat $TASK` to signal liveness during long operations. |
+| `reclaimed` | `{stale_lock, actor}` (manual: `{prev_lock, reason, actor}`) | Claim TTL expired without a completion; task goes back to `ready`. An automatic reclaim counts as one non-successful attempt toward the `gave_up` breaker (a claim that never spawned a worker would otherwise loop claim → reclaim → claim forever); an operator `reclaim` resets the counter instead. |
 | `crashed` | `{pid, claimer, exit_kind?, exit_code?, worker_output?}` | Worker PID no longer alive but TTL hadn't expired yet. `worker_output` is the tail of the worker's own log (its final response or the rendered provider error, chrome stripped, ≤ 400 chars) and is also appended to the task's `last_failure_error`, so the board shows *why* instead of only the exit code. |
 | `timed_out` | `{pid, elapsed_seconds, limit_seconds, sigkill}` | `max_runtime_seconds` exceeded; dispatcher SIGTERM'd (then SIGKILL'd after 5 s grace) and re-queued. |
 | `stale` | `{elapsed_seconds, last_heartbeat_at, heartbeat_age_seconds, timeout_seconds, pid, terminated}` | Task ran longer than `kanban.dispatch_stale_timeout_seconds` (default 4 h) AND no `kanban_heartbeat` arrived in the last hour. Dispatcher SIGTERM'd the host-local worker (if any), reset the task to `ready` for re-dispatch. Does NOT tick the failure counter (stale is dispatcher-side absence detection, not a worker fault). Workers running long operations should call `kanban_heartbeat` at least once an hour to avoid this. |
