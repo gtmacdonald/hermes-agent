@@ -1981,7 +1981,8 @@ def dispatch_once(
                 conn, eligibility_scope, board=board, spawn_fn=spawn_fn, dry_run=dry_run,
                 max_spawn=max_spawn, max_in_progress=max_in_progress,
                 failure_limit=failure_limit, ttl_seconds=ttl_seconds,
-                per_profile_cap=max_in_progress_per_profile)
+                per_profile_cap=max_in_progress_per_profile,
+                stale_timeout_seconds=stale_timeout_seconds, reconcile_orphans=reconcile_orphans)
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
@@ -2018,14 +2019,20 @@ def dispatch_once(
 
 
 def _dispatch_reviewed_once(conn, scope, *, board, spawn_fn, dry_run, max_spawn,
-                            max_in_progress, failure_limit, ttl_seconds, per_profile_cap):
-    """Finite automatic scope: no board-wide promotion, reclaim or review dispatch.
+                            max_in_progress, failure_limit, ttl_seconds, per_profile_cap,
+                            stale_timeout_seconds=0, reconcile_orphans=True):
+    """Finite automatic scope: no board-wide promotion or review dispatch.
 
-    Running workers keep their normal lifecycle. Failed attempts require a new
-    reviewed approval; this path never retries or revives parked cards.
+    Running workers keep their normal lifecycle: crash, stale, orphan and max-runtime
+    sweeps run every tick, as upstream (without promotion). Failed attempts
+    require a new reviewed approval; eligibility refuses any card that already ran, so
+    a reclaim back to ready is never an automatic retry.
     """
     from hermes_cli.kanban_dispatch_scope import reviewed_entries, eligible, other_running_readonly
     result = DispatchResult()
+    _run_reclaim_phase(conn, result, stale_timeout_seconds=stale_timeout_seconds,
+                       failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
+                       board=board, promote=False)
     entries = reviewed_entries(scope, board)
     if not entries:
         return result
@@ -2238,8 +2245,10 @@ def _run_reclaim_phase(
     failure_limit: int,
     reconcile_orphans: bool,
     board: Optional[str] = None,
+    promote: bool = True,
 ) -> None:
-    """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
+    """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote (unless
+    ``promote=False``: the fork-local reviewed scope never promotes board-wide)."""
     reap_worker_zombies()
     result.reaped_terminal_workers = reap_terminal_workers(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
@@ -2252,7 +2261,8 @@ def _run_reclaim_phase(
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
     result.rate_limited.extend(getattr(detect_crashed_workers, "_last_rate_limited", []))
     result.timed_out = enforce_max_runtime(conn)
-    result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
+    if promote:
+        result.promoted = _kb.recompute_ready(conn, failure_limit=failure_limit)
 
 
 def _tick_spawn_budget(
@@ -2946,9 +2956,13 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     if profile_home and task.provider_override and task.model_override:
         import hermes_yaml as yaml
         from hermes_cli.kanban_ready_cycle import approvals
-        cfg = yaml.safe_load((Path(profile_home) / "config.yaml").read_text()) or {}
-        route = cfg.get("providers", {}).get(task.provider_override, {})
-        endpoint = route.get("base_url", "")
+        try:
+            cfg = yaml.safe_load((Path(profile_home) / "config.yaml").read_text()) or {}
+            route = ((cfg.get("providers") or {}) if isinstance(cfg, dict) else {}).get(task.provider_override) or {}
+            endpoint = (route.get("base_url") or "") if isinstance(route, dict) else ""
+        except Exception:
+            # Unreadable profile config: no LAN pin; the worker's own config load decides.
+            endpoint = ""
         probe = dict(board="worker", task_id=task.id, spec_sha256="probe", approved=True,
                      expires_at=time.time()+60, provider=task.provider_override, model=task.model_override, endpoint=endpoint)
         if approvals({"dispatch_ready_scope": [probe]}):

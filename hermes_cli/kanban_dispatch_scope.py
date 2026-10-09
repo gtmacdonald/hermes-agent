@@ -95,3 +95,26 @@ def other_running_readonly(kb, board):
     except Exception:
         # Unknown host occupancy must not silently widen the concurrency budget.
         return None
+
+
+def boards_with_running_readonly(kb):
+    """Board slugs whose DB has a ``running`` task, read-only (no open/migrate of idle boards).
+
+    Scoped dispatch must still tick these so crash/stale/max-runtime sweeps reclaim workers."""
+    import sqlite3
+    slugs = set()
+    try:
+        for meta in kb.list_boards(include_archived=False):
+            slug = meta.get("slug") or kb.DEFAULT_BOARD
+            path = kb.kanban_db_path(board=slug).expanduser().resolve()
+            if not path.exists():
+                continue
+            conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
+            try:
+                if conn.execute("SELECT 1 FROM tasks WHERE status='running' LIMIT 1").fetchone():
+                    slugs.add(slug)
+            finally:
+                conn.close()
+    except Exception:
+        pass
+    return slugs
