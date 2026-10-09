@@ -1873,6 +1873,7 @@ def _append_event(
     run_id: Optional[int] = None,
 ) -> None:
     """Insert an event row inside the caller's txn; ``run_id`` groups it by attempt (NULL = task-scoped)."""
+    payload = _with_actor(kind, payload)
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)", (task_id, run_id, kind, _json_or_null(payload), int(time.time())),
@@ -2224,7 +2225,9 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        run_id = _claim_and_open_run(
+            conn, task_id, "ready", lock, expires, now, event_extra={"actor": resolve_actor(claimer)},
+        )
         if run_id is None:
             return None
         claimed = get_task(conn, task_id)
@@ -2255,7 +2258,8 @@ def claim_review_task(
                 )
             return None
         run_id = _claim_and_open_run(
-            conn, task_id, "review", lock, expires, now, event_extra={"source_status": "review"},
+            conn, task_id, "review", lock, expires, now,
+            event_extra={"source_status": "review", "actor": resolve_actor(claimer)},
         )
         if run_id is None:
             return None
@@ -2632,26 +2636,12 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
-class LiveClaimError(ValueError):
-    """``complete_task`` refused: the task is ``running`` under a live claim and
-    the caller neither owns its run (``expected_run_id``) nor passed ``force``.
-    Completing anyway would close the worker's run row underneath a process
-    that is still executing. A ``ValueError`` so tool error handlers treat it
-    as recoverable."""
-
-    def __init__(self, task_id: str):
-        super().__init__(
-            f"{task_id} is running under a live worker claim; pass expected_run_id "
-            "(worker ownership) or force=True (explicit operator override) instead "
-            "of closing the live run"
-        )
-
-
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
+    actor: Optional[str] = None, force_reason: Optional[str] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2701,7 +2691,7 @@ def complete_task(
         # (expected_run_id) or an explicit human override (force=True); see
         # _claim_is_live for what "live" means.
         if expected_run_id is None and not force and trow and _claim_is_live(trow):
-            raise LiveClaimError(task_id)
+            raise LiveClaimError(task_id, holder=trow["claim_lock"])
         sql = """
                 UPDATE tasks
                    SET status       = 'done',
@@ -2739,11 +2729,9 @@ def complete_task(
         event_summary = handoff_summary
         if prior_status == "review" and not event_summary:
             event_summary = _REVIEW_APPROVED_NOTE
-        _append_event(
-            conn, task_id, "completed",
+        _append_event(conn, task_id, "completed", _completed_actor_payload(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
-            run_id=run_id,
-        )
+            actor=actor, force=force, force_reason=force_reason), run_id=run_id)
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     # Success wipes the breaker counter (history stays on the event log).
     _clear_failure_counter(conn, task_id)
@@ -4442,7 +4430,15 @@ from hermes_cli.kanban_db_workspace import (
     _managed_scratch_path_info,
     _scratch_workspace,
 )
-from hermes_cli.kanban_db_claims import _claim_is_live, claimer_problem, is_named_claim
+from hermes_cli.kanban_db_claims import (
+    LiveClaimError,
+    _claim_is_live,
+    _completed_actor_payload,
+    _with_actor,
+    claimer_problem,
+    is_named_claim,
+    resolve_actor,
+)
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,

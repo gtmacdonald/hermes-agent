@@ -328,7 +328,8 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
         elif worker_lock:
             # Same as the kanban_heartbeat tool: renewal is best effort, the event is the signal.
             kb.heartbeat_claim(conn, tid, ttl_seconds=ttl, claimer=worker_lock)
-        ok = kbd.heartbeat_worker(conn, tid, note=getattr(args, "note", None), expected_run_id=run_id)
+        ok = kbd.heartbeat_worker(conn, tid, note=getattr(args, "note", None), expected_run_id=run_id,
+                                 actor=claimer)
     return _ok_or_err(ok, f"cannot heartbeat {tid} (not running?)",
                       f"Heartbeat recorded for {tid}")
 
@@ -796,7 +797,8 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         if len(body) > args.max_len:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
-    author = args.author or _profile_author()
+    # An external harness that set its claimer speaks as that claimer, not as the profile.
+    author = args.author or _named_claimer(args) or _profile_author()
     with kbc.connect_closing() as conn:
         kb.add_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
@@ -968,6 +970,15 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     metadata, rc = _parse_metadata_flag(raw_meta)
     if rc:
         return rc
+    force = bool(getattr(args, "force", False))
+    force_reason = (getattr(args, "reason", None) or "").strip() or None
+    if force_reason and not force:
+        return _err("kanban complete: --reason explains an override; pass it with --force "
+                    "(or drop --reason)", 2)
+    if force and not force_reason:
+        # Bare --force predates --reason and callers rely on it: warn, do not refuse.
+        print("warning: --force without --reason; say why with --reason TEXT "
+              "(it is recorded on the completed event)", file=sys.stderr)
     fail_msg: dict[str, str] = {}
     claimer = _named_claimer(args)
     with kbc.connect_closing() as conn:
@@ -983,18 +994,20 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_owned_run_id(conn, tid, claimer),
-                                        force=bool(getattr(args, "force", False)))
-            except kb.LiveClaimError:
-                current = kb.get_task(conn, tid)
-                lock = current.claim_lock if current else None
+                                        force=force, force_reason=force_reason,
+                                        actor=getattr(args, "claimer", None))
+            except kb.LiveClaimError as claim_err:
+                # The lock that refused, read inside complete_task's txn: no re-read, so a
+                # task removed meanwhile cannot break the message.
+                lock = claim_err.holder
                 if kb.is_named_claim(lock):
                     fail_msg[tid] = (f"cannot complete {tid}: it is claimed by {lock}. Complete it as "
                                      f"that holder (--claimer {lock}), `hermes kanban reclaim {tid}` to "
-                                     f"release it, or re-run with --force to complete anyway.")
+                                     f"release it, or re-run with --force --reason TEXT to complete anyway.")
                 else:
                     fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
                                      f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
-                                     f"--force to close its run and complete anyway.")
+                                     f"--force --reason TEXT to close its run and complete anyway.")
                 return False
             except kb.EmptyCompletionError as empty_err:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "

@@ -762,6 +762,12 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"artifact path or storage error, then retry kanban_complete with the same "
                 f"handoff.")
         except kb.LiveClaimError as claim_err:
+            if kb.is_named_claim(claim_err.holder):
+                # An external harness session holds the card by lease, not a worker process.
+                return tool_error(
+                    f"kanban_complete refused: {claim_err}. Nothing changed. {claim_err.holder} "
+                    f"holds this card: leave it to that session, wait for its claim to lapse, or "
+                    f"an operator can run `hermes kanban complete --force --reason TEXT {tid}`.")
             # Env-less caller (orchestrator, another session) on a card a dispatcher
             # worker is executing: refusing here is what keeps that worker's run open.
             return tool_error(
