@@ -8,6 +8,8 @@ import pytest
 
 from agent import spend_policy as sp
 
+pytestmark = pytest.mark.real_spend_policy
+
 OPENROUTER = "https://openrouter.ai/api/v1/chat/completions"
 VERCEL = "https://ai-gateway.vercel.sh/v1/chat/completions"
 MODEL = "google/gemini-2.5-flash-lite"
