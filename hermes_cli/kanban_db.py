@@ -3760,8 +3760,9 @@ def specify_triage_task(
     txn; False when not in triage. Lands in ``todo`` (not ``ready``) so parent
     gating still applies; the audit comment is written only when a field changed.
     A reviewed hash binds manual acceptance to all saved fields and forbids
-    active claims or rewriting. ``recompute=False`` leaves only this task in
-    todo; the default preserves existing specifier readiness behavior.
+    active claims or rewriting. ``recompute=False`` skips the immediate readiness
+    recompute (the task stays todo until the next normal recompute, e.g. ``list`` or a
+    dispatcher tick); the default preserves existing specifier readiness behavior.
     """
     if title is not None and not title.strip():
         raise ValueError("title cannot be blank")
