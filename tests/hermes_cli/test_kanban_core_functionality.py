@@ -969,6 +969,11 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
             "kanban": {
                 "dispatch_in_gateway": True,
                 "dispatch_interval_seconds": 1,
+                # Fork-local scoped dispatch opens only boards with a reviewed entry.
+                "dispatch_scope": [{
+                    "board": _kb.DEFAULT_BOARD, "approved": True, "expires_at": time.time() + 3600,
+                    "task_id": "t_corrupt", "task_sha256": "0" * 64, "judge_sha256": "0" * 64,
+                }],
             }
         },
     )
