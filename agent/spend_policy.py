@@ -59,7 +59,7 @@ def prepare(url, body, *, policy_path=None):
         require(spec['source'].startswith('https://') and spec['checked_on'])
         require(urlsplit(str(url)).path in spec['paths'])
         require(len(json.dumps(body).encode()) <= limits['max_body_bytes'])
-    except (OSError, KeyError, ValueError, TypeError, AssertionError):
+    except (OSError, KeyError, ValueError, TypeError, AssertionError, ArithmeticError, AttributeError):
         raise SpendDenied('model spend policy denied: missing, invalid, expired or unlisted route/model') from None
     # These fields can select extra models, paid server tools or alternate price classes.
     for field in ('models', 'plugins', 'web_search_options', 'search_parameters', 'modalities', 'audio', 'service_tier', 'routing', 'transforms'):
