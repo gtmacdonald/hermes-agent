@@ -85,7 +85,8 @@ _TENANT = _arg("--tenant", help="Tenant namespace")
 _PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
 _CLAIMER = _arg("--claimer", help="Who holds the claim, as <kind>:<id> (e.g. claude:<session-id>); "
-                                  "default: $HERMES_KANBAN_CLAIMER")
+                                  "default: $HERMES_KANBAN_CLAIMER. Cooperative: it keeps harnesses from "
+                                  "colliding, it does not authenticate them")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
     _arg("--chat-id", required=True),

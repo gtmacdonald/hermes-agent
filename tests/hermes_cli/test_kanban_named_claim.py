@@ -146,6 +146,30 @@ def test_heartbeat_by_a_non_holder_fails_and_changes_nothing(kanban_home):
     assert "heartbeat" not in kinds
 
 
+def test_heartbeat_ttl_without_a_claimer_is_refused(kanban_home):
+    """--ttl only means something for a claim the caller can name; silently ignoring it
+    would let an anonymous claimer believe the card was extended."""
+    tid = _ready_task()
+    kc.run_slash(f"claim {tid}")
+    expires = _task(tid).claim_expires
+    out = kc.run_slash(f"heartbeat {tid} --ttl 7200")
+    assert "--claimer" in out, out
+    assert _task(tid).claim_expires == expires
+
+
+def test_worker_scope_guard_runs_before_any_renewal(kanban_home, monkeypatch):
+    """A worker scoped to one task must not renew a claim on another, even by naming its holder."""
+    tid = _ready_task()
+    kc.run_slash(f"claim {tid} --claimer {OWNER}")
+    expires = int(time.time()) + 60
+    _set_claim_expires(tid, expires)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_other")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "1")
+    out = kc.run_slash(f"heartbeat {tid} --claimer {OWNER}")
+    assert "scoped to task t_other" in out, out
+    assert _task(tid).claim_expires == expires
+
+
 def test_renewed_named_claim_survives_the_stale_sweep(kanban_home):
     tid = _ready_task()
     kc.run_slash(f"claim {tid} --claimer {OWNER}")

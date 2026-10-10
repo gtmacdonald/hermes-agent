@@ -314,17 +314,21 @@ def _cmd_heartbeat(args: argparse.Namespace) -> int:
     tid, ttl = args.task_id, getattr(args, "ttl", None)
     # A dispatcher-pinned worker keeps its own lock even if the env also names a claimer.
     worker_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
-    claimer = getattr(args, "claimer", None) or (None if worker_lock else _named_claimer(args))
+    claimer = getattr(args, "claimer", None) if worker_lock else _named_claimer(args)
+    if ttl is not None and not (claimer or worker_lock):
+        return _err(f"cannot heartbeat {tid}: --ttl renews a claim; pass --claimer <kind>:<id>", 2)
     with kbc.connect_closing() as conn:
+        # Resolved before any write: it runs the worker-scope guard, and the heartbeat
+        # event below CASes on the run whose claim was renewed.
+        run_id = _owned_run_id(conn, tid, claimer)
         if claimer:
-            if not kb.heartbeat_claim(conn, tid, ttl_seconds=ttl, claimer=claimer):
+            if run_id is None or not kb.heartbeat_claim(conn, tid, ttl_seconds=ttl, claimer=claimer):
                 return _err(f"cannot heartbeat {tid}: its claim is not held by {claimer} "
                             f"(expired, reclaimed, or never claimed); claim it again")
         elif worker_lock:
             # Same as the kanban_heartbeat tool: renewal is best effort, the event is the signal.
             kb.heartbeat_claim(conn, tid, ttl_seconds=ttl, claimer=worker_lock)
-        ok = kbd.heartbeat_worker(conn, tid, note=getattr(args, "note", None),
-                                 expected_run_id=_worker_run_id_for(tid))
+        ok = kbd.heartbeat_worker(conn, tid, note=getattr(args, "note", None), expected_run_id=run_id)
     return _ok_or_err(ok, f"cannot heartbeat {tid} (not running?)",
                       f"Heartbeat recorded for {tid}")
 
@@ -848,7 +852,10 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
 def _named_claimer(args: argparse.Namespace) -> Optional[str]:
     """The external holder (``<kind>:<id>``) this command speaks for: ``--claimer``,
     else ``$HERMES_KANBAN_CLAIMER``."""
-    return getattr(args, "claimer", None) or os.environ.get("HERMES_KANBAN_CLAIMER") or None
+    # Per-session identity, not configuration: config.yaml is shared by every session of a
+    # profile, and the holder name is no secret (same class as HERMES_KANBAN_CLAIM_LOCK).
+    env_claimer = os.environ.get("HERMES_KANBAN_CLAIMER")  # health: allow HX002 -- per-session holder identity
+    return getattr(args, "claimer", None) or env_claimer or None
 
 
 def _owned_run_id(conn, task_id: str, claimer: Optional[str]) -> Optional[int]:

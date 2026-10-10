@@ -1031,35 +1031,6 @@ def _host_prefix() -> str:
     return f"{_claimer_id().split(':', 1)[0]}:"
 
 
-# A named claimer is ``<kind>:<id>`` — e.g. ``claude:<session>``, ``codex:<thread>`` —
-# the holder form the external harnesses already use for leases.
-_NAMED_CLAIMER_RE = re.compile(r"^[a-z0-9-]+:[A-Za-z0-9._:=-]+$")
-
-
-def claimer_problem(claimer: str) -> Optional[str]:
-    """Why ``claimer`` cannot name an external claim, or None.
-
-    A named claim has no worker process, so the stale sweep and the live-claim
-    fence judge it by its lease (``claim_expires``) alone. It must therefore not
-    look like a host-local ``host:pid`` worker lock, which they judge by the pid.
-    """
-    if not _NAMED_CLAIMER_RE.match(claimer or ""):
-        return (f"claimer {claimer!r} must be <kind>:<id> (kind: lowercase letters, digits, -), "
-                "e.g. claude:<session-id>")
-    host = _host_prefix()[:-1]
-    host_names = {host.lower(), host.split(".", 1)[0].lower()}
-    kind, ident = claimer.split(":", 1)
-    if claimer.startswith(_host_prefix()) or kind in host_names or ident.lower() in host_names:
-        return (f"claimer {claimer!r} names this host, not a harness session; "
-                "use <kind>:<id>, e.g. claude:<session-id>")
-    return None
-
-
-def is_named_claim(lock: Optional[str]) -> bool:
-    """True for a claim held by an external ``<kind>:<id>`` claimer rather than a worker on this host."""
-    return bool(lock and _NAMED_CLAIMER_RE.match(lock) and not lock.startswith(_host_prefix()))
-
-
 # --- Task creation / mutation ---
 
 def _validate_model_override(model: Optional[str], provider: Optional[str]) -> tuple[Optional[str], Optional[str]]:
@@ -2674,25 +2645,6 @@ class LiveClaimError(ValueError):
             "(worker ownership) or force=True (explicit operator override) instead "
             "of closing the live run"
         )
-
-
-def _claim_is_live(trow) -> bool:
-    """True when a ``running`` task's claim still protects a run.
-
-    A worker-backed claim is live while the worker process it spawned exists
-    (PID + start-time fingerprint); TTL expiry is deliberately not consulted,
-    because ``release_stale_claims`` extends, not reclaims, the claim of a live
-    worker. A host-local claim whose worker is gone, or that never spawned one,
-    has no run to protect. A named claim (``<kind>:<id>``, see
-    :func:`claimer_problem`) has no process to check, so its lease is the
-    authority: it is live until ``claim_expires``, which its holder renews with
-    :func:`heartbeat_claim`."""
-    if trow["status"] != "running" or trow["claim_lock"] is None:
-        return False
-    if trow["worker_pid"]:
-        return _worker_alive(trow["worker_pid"], trow["worker_started_at"])
-    expires = trow["claim_expires"]
-    return is_named_claim(trow["claim_lock"]) and expires is not None and int(expires) > time.time()
 
 
 def complete_task(
@@ -4490,6 +4442,7 @@ from hermes_cli.kanban_db_workspace import (
     _managed_scratch_path_info,
     _scratch_workspace,
 )
+from hermes_cli.kanban_db_claims import _claim_is_live, claimer_problem, is_named_claim
 from hermes_cli.kanban_db_dispatch import (
     DEFAULT_FAILURE_LIMIT,
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
