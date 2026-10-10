@@ -77,6 +77,16 @@ def eligible(conn, entry):
                for c in comments)
 
 
+RUNNING_SQL = "SELECT COUNT(*) FROM tasks WHERE status='running'"
+# On a harness board only a spawned worker (it has a pid) uses a host slot; the
+# other running rows there are external sessions' CLI claims (F-040).
+RUNNING_WORKERS_SQL = RUNNING_SQL + " AND worker_pid IS NOT NULL"
+
+
+def host_slot_sql(slug):
+    return RUNNING_WORKERS_SQL if slug in HARNESS_BOARDS else RUNNING_SQL
+
+
 def other_running_readonly(kb, board):
     """Honor the shared host cap without migrating or writing other boards."""
     import sqlite3
@@ -84,13 +94,14 @@ def other_running_readonly(kb, board):
         seen = {kb.kanban_db_path(board=board).expanduser().resolve()}
         total = 0
         for meta in kb.list_boards(include_archived=False):
-            path = kb.kanban_db_path(board=meta.get("slug") or kb.DEFAULT_BOARD).expanduser().resolve()
+            slug = meta.get("slug") or kb.DEFAULT_BOARD
+            path = kb.kanban_db_path(board=slug).expanduser().resolve()
             if path in seen or not path.exists():
                 continue
             seen.add(path)
             conn = sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)
             try:
-                total += conn.execute("SELECT COUNT(*) FROM tasks WHERE status='running'").fetchone()[0]
+                total += conn.execute(host_slot_sql(slug)).fetchone()[0]
             finally:
                 conn.close()
         return total
