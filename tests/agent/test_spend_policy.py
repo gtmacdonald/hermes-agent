@@ -190,3 +190,18 @@ def test_legacy_only_policy_cannot_override_missing_authoritative_scalar(tmp_pat
     path.write_text(json.dumps(cfg))
     with pytest.raises(sp.SpendDenied):
         sp.prepare(VERCEL, _body(), policy_path=path)
+
+
+@pytest.mark.parametrize("field", ["max_usd_per_million_tokens", "price"])
+def test_oversized_policy_numbers_deny_instead_of_crashing(tmp_path, field):
+    """CodeRabbit (PR 20): an integer too large for a float must deny, not raise OverflowError."""
+    path = _policy(tmp_path)
+    cfg = json.loads(path.read_text())
+    huge = 10 ** 400
+    if field == "price":
+        cfg["lanes"]["openrouter"]["models"][MODEL]["input_usd_per_million"] = huge
+    else:
+        cfg[field] = huge
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(sp.SpendDenied):
+        sp.prepare(OPENROUTER, _body(), policy_path=path)
