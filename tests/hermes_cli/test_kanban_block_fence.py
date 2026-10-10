@@ -143,3 +143,25 @@ def test_in_place_classification_library_actor(kanban_home):
               for t in (named, anon)}
     assert by[named] == OWNER
     assert by[anon] == kb._claimer_id()
+
+
+def test_routed_block_events_always_name_an_actor(kanban_home):
+    """``dependency_wait`` and ``block_loop_detected`` (the other events block_task emits)
+    name the explicit actor when given and resolve one otherwise, like ``blocked`` does."""
+    with kbc.connect() as conn:
+        parent = kb.create_task(conn, title="parent", body="x")
+        waiter = kb.create_task(conn, title="waiter", body="x", parents=[parent])
+        looper = kb.create_task(conn, title="looper", body="x")
+        with kb.write_txn(conn):
+            conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (waiter,))
+        assert kb.block_task(conn, waiter, reason="needs parent", kind="dependency") is True
+        assert kb.block_task(conn, looper, reason="first", kind="needs_input", actor=OWNER) is True
+        assert kb.unblock_task(conn, looper) is True
+        assert kb.block_task(conn, looper, reason="again", kind="needs_input") is True
+        wait = [e for e in kb.list_events(conn, waiter) if e.kind == "dependency_wait"][-1]
+        loop = [e for e in kb.list_events(conn, looper) if e.kind == "block_loop_detected"][-1]
+        assert kb.get_task(conn, looper).status == "triage"
+    assert wait.payload.get("actor") == kb._claimer_id()
+    assert loop.payload.get("actor") == kb._claimer_id()
+    explicit = kb._route_block("dependency", "r", "ready", prev_kind=None, prev_recurrences=0, actor=OWNER)
+    assert explicit[4]["actor"] == OWNER
