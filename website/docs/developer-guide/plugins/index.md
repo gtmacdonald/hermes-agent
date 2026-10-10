@@ -408,7 +408,7 @@ The rules:
   duplicate name that loses to another directory, a plugin disabled in config)
   is still attributed by its own manifest. Code outside every plugins root
   (project plugins, entry-point plugins) is skipped on the stack, so it runs
-  under the nearest declared plugin frame below it. Call the helper
+  under the nearest plugin frame below it (a frame under a plugins root), and that frame's own manifest decides; there is no fall-through to an outer frame. Call the helper
   from your own function. Handing the bare helper to `run_in_executor` leaves no
   plugin frame on the stack, so the call is refused.
 - **Provider origins only.** For `openai-codex` the token is sent only to
