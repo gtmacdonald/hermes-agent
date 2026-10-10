@@ -399,10 +399,16 @@ The rules:
   itself returns for it (`plugins/<name>/`, or `plugins/<category>/<name>/`) and
   reads that plugin's `plugin.yaml`; a `plugin.yaml` nested deeper inside the
   plugin is ignored. A plugin that does not list the provider in
-  `requires_auth`, and code that discovery would not load (outside any plugin,
-  or under a directory discovery skips, such as `__pycache__`-style dunder
+  `requires_auth`, and code under a plugins root that is not in a directory
+  discovery's `scan_directory` returns (for example `__pycache__`-style dunder
   directories, other harnesses' `.claude-plugin`-style directories, or a
-  category whose own manifest entry is unusable), gets `PermissionError`. Call the helper
+  category whose own manifest entry is unusable), gets `PermissionError`. This
+  is scan-level, not load-level: a directory `scan_directory` returns but the
+  loader later drops (an impostor that reuses a bundled plugin's name, a
+  duplicate name that loses to another directory, a plugin disabled in config)
+  is still attributed by its own manifest. Code outside every plugins root
+  (project plugins, entry-point plugins) is skipped on the stack, so it runs
+  under the nearest declared plugin frame below it. Call the helper
   from your own function. Handing the bare helper to `run_in_executor` leaves no
   plugin frame on the stack, so the call is refused.
 - **Provider origins only.** For `openai-codex` the token is sent only to
