@@ -120,7 +120,8 @@ class _OpenAIProxy:
     __slots__ = ()
 
     def __call__(self, *args, **kwargs):
-        return _load_openai_cls()(*args, **kwargs)
+        from agent.spend_policy import guard_client
+        return guard_client(_load_openai_cls()(*args, **kwargs))
 
     def __instancecheck__(self, obj):
         return isinstance(obj, _load_openai_cls())
