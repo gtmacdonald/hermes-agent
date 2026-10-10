@@ -42,12 +42,20 @@ class ProviderResponse:
         return _json.loads(self.body)
 
 
-def _codex_auth(url: str) -> tuple[dict[str, str], str]:
-    """``(auth headers, credential base URL)`` from Hermes's own locked-refresh resolver."""
+def _codex_auth(url: str, origins: frozenset) -> tuple[dict[str, str], frozenset]:
+    """``(auth headers, origins this credential may be sent to)`` from Hermes's locked-refresh resolver.
+
+    Only the profile's own ChatGPT sign-in (the Hermes auth store, routed to the canonical Codex
+    backend) may cross between the provider's origins: core's Codex chat backend is chatgpt.com
+    (``DEFAULT_CODEX_BASE_URL``), and that OAuth access token is what hermes-live-voice uses to mint
+    an OpenAI Realtime client secret at api.openai.com (commit 4070f011a2; the
+    ``website/docs/developer-guide/plugins`` example). Every other credential is pinned to the
+    origin of its routed base URL: a pooled row (gateway key, api.openai.com key, or OAuth row) and
+    a sign-in rerouted by ``HERMES_CODEX_BASE_URL`` belong to that host only (#121486)."""
     from agent.codex_headers import codex_account_headers
     from agent.turn_failure_copy import oauth_relogin_command
     from hermes_cli.auth_codex import resolve_codex_runtime_credentials
-    from hermes_cli.auth_constants import AuthError
+    from hermes_cli.auth_constants import DEFAULT_CODEX_BASE_URL, AuthError
 
     try:
         creds = resolve_codex_runtime_credentials()
@@ -62,12 +70,17 @@ def _codex_auth(url: str) -> tuple[dict[str, str], str]:
             "or sign in to OpenAI Codex under Providers in the Hermes desktop app.")
     headers = codex_account_headers(token) if url_origin(url)[1] == "chatgpt.com" else {}
     headers["Authorization"] = f"Bearer {token}"
-    return headers, str(creds.get("base_url") or "")
+    route = url_origin(str(creds.get("base_url") or ""))
+    if route not in origins:
+        return headers, frozenset()  # a custom endpoint's key: none of the provider's origins
+    own_sign_in = creds.get("source") != "credential_pool" and route == url_origin(DEFAULT_CODEX_BASE_URL)
+    return headers, origins if own_sign_in else frozenset({route})
 
 
 # provider -> (origins its token may be sent to, auth resolver). chatgpt.com is the Codex backend
 # core itself calls; api.openai.com hosts the Realtime client-secret endpoint Codex clients use.
-_PROVIDERS: dict[str, tuple[frozenset, Callable[[str], tuple[dict[str, str], str]]]] = {
+# The resolver narrows the origins to the ones the resolved credential itself may reach.
+_PROVIDERS: dict[str, tuple[frozenset, Callable[[str, frozenset], tuple[dict[str, str], frozenset]]]] = {
     "openai-codex": (frozenset({("https", "chatgpt.com", 443), ("https", "api.openai.com", 443)}), _codex_auth),
 }
 
@@ -85,16 +98,26 @@ def _calling_plugin_dir() -> Optional[Path]:
         raw = Path(frame.f_code.co_filename)
         for path in (raw.absolute(), raw.resolve()):
             root = next((r for r in roots if path.is_relative_to(r) and path != r), None)
-            if root is None:
-                continue
-            for parent in path.parents:
-                if parent == root:
-                    break
-                if (parent / "plugin.yaml").is_file() or (parent / "plugin.yml").is_file():
-                    return parent
-            return root / path.relative_to(root).parts[0]
+            if root is not None:
+                return _owning_plugin_dir(root, path.relative_to(root).parts)
         frame = frame.f_back
     return None
+
+
+def _has_manifest(directory: Path) -> bool:
+    return any((directory / name).is_file() for name in ("plugin.yaml", "plugin.yml", "plugin.json"))
+
+
+def _owning_plugin_dir(root: Path, parts: tuple[str, ...]) -> Path:
+    """The installed plugin that owns ``root/<parts>``, by discovery's own rule (``scan_directory``):
+    ``root/<name>`` when it has a manifest, else the category layout ``root/<cat>/<name>``. Resolved
+    top-down, so a ``plugin.yaml`` nested inside a plugin can never stand in for the installed one.
+    A portable ``plugin.json`` package owns its tree but has no native manifest, so it declares no
+    ``requires_auth`` and is refused; so is code under a directory discovery would not load."""
+    flat = root / parts[0]
+    if len(parts) > 2 and not _has_manifest(flat) and _has_manifest(flat / parts[1]):
+        return flat / parts[1]
+    return flat
 
 
 def declared_auth_providers(manifest: Mapping[str, Any]) -> list[str]:
@@ -140,10 +163,12 @@ def credentialed_provider_request(
             f"Plugin '{plugin_dir.name}' must declare `requires_auth: [{provider}]` in plugin.yaml")
     if url_origin(url) not in origins:
         raise PermissionError(f"Refusing to send the {provider} sign-in to {url_origin(url)[1] or url!r}")
-    auth_headers, credential_base = resolve(url)
-    if url_origin(credential_base) not in origins:
-        # A pooled gateway key belongs to its own host only (#121486).
-        raise PermissionError(f"This profile's {provider} credential routes to a custom endpoint; refusing")
+    auth_headers, credential_origins = resolve(url, origins)
+    if url_origin(url) not in credential_origins:
+        # A pooled or rerouted key belongs to its routed host only (#121486).
+        raise PermissionError(
+            f"This profile's {provider} credential routes to another endpoint than "
+            f"{url_origin(url)[1] or url!r}; refusing")
     sent = {k: v for k, v in (headers or {}).items() if str(k).lower() not in {h.lower() for h in auth_headers}}
     import httpx
 
