@@ -1878,19 +1878,17 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
-def count_running_tasks(conn: sqlite3.Connection) -> int:
+def count_running_tasks(conn: sqlite3.Connection, *, workers_only: bool = False) -> int:
     """Number of tasks in ``status='running'``.
 
     Used by the multi-board sweep to count OTHER boards' workers against the
     host-level budget — the memory-derived cap bounds the machine, not the
     board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
+    ``workers_only`` counts only rows with a worker pid (harness boards, F-040).
     """
+    sql = "SELECT COUNT(*) FROM tasks WHERE status = 'running'" + (" AND worker_pid IS NOT NULL" if workers_only else "")
     try:
-        return int(
-            conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
-        )
+        return int(conn.execute(sql).fetchone()[0])
     except Exception:
         return 0
 
@@ -1923,7 +1921,8 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
                 continue
             other = _kbc.connect(board=slug)
             try:
-                total += count_running_tasks(other)
+                from hermes_cli.kanban_dispatch_scope import HARNESS_BOARDS
+                total += count_running_tasks(other, workers_only=slug in HARNESS_BOARDS)
             finally:
                 with contextlib.suppress(Exception):
                     other.close()
