@@ -968,7 +968,8 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                                         expected_run_id=_owned_run_id(conn, tid, claimer),
                                         force=bool(getattr(args, "force", False)))
             except kb.LiveClaimError:
-                lock = kb.get_task(conn, tid).claim_lock
+                current = kb.get_task(conn, tid)
+                lock = current.claim_lock if current else None
                 if kb.is_named_claim(lock):
                     fail_msg[tid] = (f"cannot complete {tid}: it is claimed by {lock}. Complete it as "
                                      f"that holder (--claimer {lock}), `hermes kanban reclaim {tid}` to "
