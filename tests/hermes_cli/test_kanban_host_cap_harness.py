@@ -147,3 +147,13 @@ def test_spawned_harness_worker_blocks_the_cap_on_both_paths(home):
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
         result = home.kbd.dispatch_once(conn, board="acc", max_spawn=8, max_in_progress=1, spawn_fn=_spawn)
     assert result.spawned == []
+
+
+def test_cli_claims_on_the_dispatched_harness_board_do_not_fill_the_cap(home):
+    """CodeRabbit (PR 21): the current board's host count uses the same rule."""
+    _claude_cli_claims(home)
+    with home.kbc.connect_closing(board="claude") as conn:
+        tid = home.kb.create_task(conn, title="nudged", body="x", assignee="professor")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
+        result = home.kbd.dispatch_once(conn, board="claude", max_spawn=8, max_in_progress=1, spawn_fn=_spawn)
+    assert [s[0] for s in result.spawned] == [tid]

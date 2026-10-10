@@ -1878,15 +1878,16 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
-def count_running_tasks(conn: sqlite3.Connection, *, workers_only: bool = False) -> int:
+def count_running_tasks(conn: sqlite3.Connection, board: Optional[str] = None) -> int:
     """Number of tasks in ``status='running'``.
 
     Used by the multi-board sweep to count OTHER boards' workers against the
     host-level budget — the memory-derived cap bounds the machine, not the
     board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
-    ``workers_only`` counts only rows with a worker pid (harness boards, F-040).
+    On a harness ``board`` only rows with a worker pid count; CLI claims there use no host slot (F-040).
     """
-    sql = "SELECT COUNT(*) FROM tasks WHERE status = 'running'" + (" AND worker_pid IS NOT NULL" if workers_only else "")
+    from hermes_cli.kanban_dispatch_scope import HARNESS_BOARDS
+    sql = "SELECT COUNT(*) FROM tasks WHERE status = 'running'" + (" AND worker_pid IS NOT NULL" if board in HARNESS_BOARDS else "")
     try:
         return int(conn.execute(sql).fetchone()[0])
     except Exception:
@@ -1921,8 +1922,7 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
                 continue
             other = _kbc.connect(board=slug)
             try:
-                from hermes_cli.kanban_dispatch_scope import HARNESS_BOARDS
-                total += count_running_tasks(other, workers_only=slug in HARNESS_BOARDS)
+                total += count_running_tasks(other, board=slug)
             finally:
                 with contextlib.suppress(Exception):
                     other.close()
@@ -2298,7 +2298,7 @@ def _tick_spawn_budget(
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
-        total_running = running_count + (count_running_tasks_other_boards(board)
+        total_running = count_running_tasks(conn, board=board) + (count_running_tasks_other_boards(board)
                                          if other_board_running is None else other_board_running)
         if total_running >= max_in_progress:
             return False, None
