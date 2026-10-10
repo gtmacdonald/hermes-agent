@@ -221,3 +221,42 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# Board-level reviewed-dispatch signals (F-039)
+# ---------------------------------------------------------------------------
+
+
+def _approval(task_id, expires_at):
+    return {"board": "acc", "task_id": task_id, "approved": True, "expires_at": expires_at}
+
+
+def test_dispatch_scope_starved_when_no_approval_admits_waiting_cards():
+    now = 1_800_000_000
+    diags = kd.compute_dispatch_diagnostics("acc", ["t_a", "t_b"], [], now=now)
+    assert [(d.kind, d.severity) for d in diags] == [("dispatch_scope_starved", "error")]
+    assert diags[0].data == {"board": "acc", "waiting": 2, "task_ids": ["t_a", "t_b"]}
+    assert diags[0].actions and diags[0].actions[0].suggested
+
+
+def test_dispatch_diagnostics_quiet_without_waiting_work_or_with_a_lasting_approval():
+    now = 1_800_000_000
+    assert kd.compute_dispatch_diagnostics("acc", [], [], now=now) == []
+    lasting = [_approval("t_a", now + 3 * 86400)]
+    assert kd.compute_dispatch_diagnostics("acc", ["t_a", "t_b"], lasting, now=now) == []
+
+
+@pytest.mark.parametrize("seconds_left, warned", [(3600, True), (86400, True), (86401, False), (0, False)])
+def test_approval_expiring_within_a_day(seconds_left, warned):
+    now = 1_800_000_000
+    diags = kd.compute_dispatch_diagnostics("acc", ["t_a"], [_approval("t_a", now + seconds_left)], now=now)
+    assert [(d.kind, d.severity) for d in diags] == ([("approval_expiring", "warning")] if warned else [])
+    if warned:
+        assert diags[0].data["task_id"] == "t_a" and diags[0].data["seconds_left"] == seconds_left
+
+
+def test_approval_expiring_uses_the_last_approval_for_a_card():
+    now = 1_800_000_000
+    approvals = [_approval("t_a", now + 3600), _approval("t_a", now + 3 * 86400)]
+    assert kd.compute_dispatch_diagnostics("acc", ["t_a"], approvals, now=now) == []
