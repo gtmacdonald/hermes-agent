@@ -23,7 +23,7 @@ def _policy(tmp_path, *, expires=None, enforcement="deny", require_zdr=False):
             "require_zdr": require_zdr}
     cfg = {"version": 1, "enforcement": enforcement, "expires_on": expires,
            "limits": {"max_output_tokens": 4096, "max_body_bytes": 200_000},
-           "price_ceiling": {"input_usd_per_million": 1.0, "output_usd_per_million": 5.0},
+           "max_usd_per_million_tokens": 4.0,
            "lanes": {"openrouter": {"models": {MODEL: dict(spec)}}, "vercel": {"models": {MODEL: dict(spec)}}}}
     path = tmp_path / "policy.json"
     path.write_text(json.dumps(cfg))
@@ -112,3 +112,81 @@ def test_guarded_sdk_client_rewrites_admitted_and_blocks_denied_requests(tmp_pat
     # Guarding twice does not stack hooks.
     assert sp.guard_client(client) is client
     assert client._client.event_hooks["request"].count(sp.httpx_hook) == 1
+
+
+@pytest.mark.parametrize('input_rate,output_rate,allowed', [
+    (0, 0, True), (3.9, 3.9, True), (4, .1, True), (.1, 4, True), (4, 4, True),
+    (4.000001, .1, False), (.1, 4.000001, False), (4.1, 4.1, False),
+    (-1, .1, False), (.1, -1, False), (True, .1, False), (.1, True, False),
+    (float('nan'), .1, False), (.1, float('nan'), False),
+    (float('inf'), .1, False), (.1, float('inf'), False),
+    ('1', .1, False), (.1, '1', False), (None, .1, False), (.1, None, False),
+])
+def test_single_ceiling_uses_max_of_both_validated_rates(tmp_path, input_rate, output_rate, allowed):
+    path = _policy(tmp_path)
+    cfg = json.loads(path.read_text())
+    for lane in cfg['lanes'].values():
+        spec = lane['models'][MODEL]
+        spec.update(input_usd_per_million=input_rate, output_usd_per_million=output_rate)
+    path.write_text(json.dumps(cfg))
+    for url in (OPENROUTER, VERCEL):
+        if not allowed:
+            with pytest.raises(sp.SpendDenied):
+                sp.prepare(url, _body(), policy_path=path)
+        else:
+            out = sp.prepare(url, _body(), policy_path=path)
+            assert out['max_tokens'] == cfg['limits']['max_output_tokens']
+            if url == OPENROUTER:
+                assert out['provider']['max_price'] == {'prompt': input_rate, 'completion': output_rate, 'request': 0}
+                assert out['provider']['only'] == cfg['lanes']['openrouter']['models'][MODEL]['providers']
+                assert out['provider']['allow_fallbacks'] is False
+            else:
+                assert out['providerOptions']['gateway']['only'] == cfg['lanes']['vercel']['models'][MODEL]['providers']
+
+
+@pytest.mark.parametrize('ceiling', [-1, True, None, '4', float('nan'), float('inf'), {}, []])
+def test_invalid_single_ceiling_denies_instead_of_using_legacy_limits(tmp_path, ceiling):
+    path = _policy(tmp_path)
+    cfg = json.loads(path.read_text())
+    cfg['max_usd_per_million_tokens'] = ceiling
+    cfg['price_ceiling'] = {'input_usd_per_million': 100, 'output_usd_per_million': 100}
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(sp.SpendDenied):
+        sp.prepare(VERCEL, _body(), policy_path=path)
+
+
+@pytest.mark.parametrize('copies,allowed', [
+    ({'input_usd_per_million': 4, 'output_usd_per_million': 4}, True),
+    ({'input_usd_per_million': 3, 'output_usd_per_million': 4}, False),
+    ({'input_usd_per_million': 4, 'output_usd_per_million': 3}, False),
+    ({'input_usd_per_million': 5, 'output_usd_per_million': 4}, False),
+    ({'input_usd_per_million': 4, 'output_usd_per_million': 5}, False),
+    ({'input_usd_per_million': True, 'output_usd_per_million': 4}, False),
+    ({'input_usd_per_million': 4, 'output_usd_per_million': '4'}, False),
+    ({'input_usd_per_million': float('nan'), 'output_usd_per_million': 4}, False),
+    ({'input_usd_per_million': 4, 'output_usd_per_million': float('inf')}, False),
+    ({'input_usd_per_million': 4}, False),
+    ({'input_usd_per_million': 4, 'output_usd_per_million': 4, 'extra': 4}, False),
+    (None, False), ([], False), (4, False),
+])
+def test_legacy_compatibility_copies_must_match_authoritative_scalar(tmp_path, copies, allowed):
+    path = _policy(tmp_path)
+    cfg = json.loads(path.read_text())
+    cfg['price_ceiling'] = copies
+    path.write_text(json.dumps(cfg))
+    for url in (VERCEL, OPENROUTER):
+        if allowed:
+            assert sp.prepare(url, _body(), policy_path=path)['max_tokens'] == cfg['limits']['max_output_tokens']
+        else:
+            with pytest.raises(sp.SpendDenied):
+                sp.prepare(url, _body(), policy_path=path)
+
+
+def test_legacy_only_policy_cannot_override_missing_authoritative_scalar(tmp_path):
+    path = _policy(tmp_path)
+    cfg = json.loads(path.read_text())
+    del cfg['max_usd_per_million_tokens']
+    cfg['price_ceiling'] = {'input_usd_per_million': 4, 'output_usd_per_million': 4}
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(sp.SpendDenied):
+        sp.prepare(VERCEL, _body(), policy_path=path)
