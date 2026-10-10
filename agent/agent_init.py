@@ -1126,6 +1126,14 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
     # expose kanban_show interactively, and children/cron runs inherit the env var, without
     # owning a task.
     from agent.delegation_context import owned_kanban_task
+    if (owned_kanban_task() and os.environ.get("HERMES_KANBAN_RUN_ID")
+            and os.environ.get("HERMES_KANBAN_CLAIM_LOCK")):
+        missing = {"kanban_complete", "kanban_block", "kanban_heartbeat"} - agent.valid_tool_names
+        if missing:
+            from hermes_cli.kanban_worker_bootstrap import KanbanWorkerToolPolicyError
+            raise KanbanWorkerToolPolicyError(
+                "kanban worker missing lifecycle tools: " + ", ".join(sorted(missing))
+                + "; review the assigned profile's tool policy before dispatch")
     from agent.prompt_builder import KANBAN_GUIDANCE
     agent._kanban_worker_guidance = (
         KANBAN_GUIDANCE if owned_kanban_task() and "kanban_show" in agent.valid_tool_names else ""

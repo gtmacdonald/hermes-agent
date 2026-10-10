@@ -292,7 +292,8 @@ class CLIInitMixin:
             except (TypeError, ValueError):
                 pass
 
-        self._fallback_model = get_fallback_chain(CLI_CONFIG)
+        from hermes_cli.kanban_worker_bootstrap import worker_fallback_chain
+        self._fallback_model = worker_fallback_chain(get_fallback_chain(CLI_CONFIG))
 
     def _init_runtime_state(self, resume):
         """Session store + all per-run mutable state (queues, overlays, pet/voice/status-bar fields)."""
