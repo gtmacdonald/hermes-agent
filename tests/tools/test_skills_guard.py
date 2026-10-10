@@ -396,6 +396,30 @@ class TestScanSkillCached:
         assert "destructive_home_rm" in prov_second.get("rules", [])
         assert second.verdict == "dangerous"
 
+    def test_safe_verdict_cached_before_trailing_double_slash_rule_is_rescanned(self, tmp_path):
+        """A `safe` verdict cached by skills-guard-v9, whose rule read `rm ... // 2>/dev/null` as a
+        comment, must not be served once the rule treats that `//` as the root."""
+        import json
+
+        from tools import skills_guard
+
+        skill_dir = tmp_path / "root-rm"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("---\nname: root-rm\ndescription: x\n---\n", encoding="utf-8")
+        (skill_dir / "install.sh").write_text(
+            "rm -rf --no-preserve-root build // 2>/dev/null\n", encoding="utf-8")
+        cache_dir = tmp_path / "cache"
+        _first, prov = skills_guard.scan_skill_cached(skill_dir, cache_dir=cache_dir)
+        stale = {**prov, "scanner_version": "skills-guard-v9", "verdict": "safe", "findings": [],
+                 "rules": [], "fresh": False}
+        (cache_file,) = cache_dir.glob("*.json")
+        cache_file.write_text(json.dumps(stale), encoding="utf-8")
+
+        result, prov_second = skills_guard.scan_skill_cached(skill_dir, cache_dir=cache_dir)
+        assert prov_second["fresh"] is True
+        assert "destructive_root_rm" in prov_second["rules"]
+        assert result.verdict == "dangerous"
+
     def test_cached_verdict_served_when_scanner_version_unchanged(self, tmp_path):
         """The same scanner version + unchanged content keeps serving the cached verdict
         (the cache stays useful; only a version/content change invalidates)."""
@@ -595,6 +619,9 @@ _INDEX_BENIGN = {
     "rm_jsonc_right_arrow_comment": '"rm -rf dist", // -> cleanup',
     # A number that is not a file-descriptor redirection is comment text too.
     "rm_jsonc_numbered_comment": '"rm -rf dist", // 2 passes',
+    # After a closed JSON string, any text is a comment, punctuation-led included.
+    "rm_jsonc_punctuation_comment": '"clean": "rm -rf build", // @todo',
+    "rm_jsonc_parenthesized_comment": '"rm -rf dist", // (optional)',
 }
 _INDEX_ADVERSARIAL = {
     "real_aws_key": 'aws_access_key_id="' + _AKIA + 'Q3EXAMPLEKEY7ABC"',
@@ -632,6 +659,10 @@ _INDEX_ADVERSARIAL = {
     "rm_double_slash_then_fat_arrow_redirect": "rm -rf --no-preserve-root build // => x",
     # The `",` must sit directly before the `//`, not on an earlier operand.
     "rm_double_slash_after_unquoted_operand_arrow": 'rm -rf --no-preserve-root "a", b // -> x',
+    # A `",` that closes a quote opened among the operands is shell, not the end of a JSON string.
+    "rm_double_slash_after_quoted_operand_arrow": 'rm -rf --no-preserve-root "build", // -> x',
+    "rm_double_slash_after_quoted_operand_redirect": 'rm -rf --no-preserve-root "build", // 2>/dev/null',
+    "rm_double_slash_after_two_quoted_commas": 'rm -rf --no-preserve-root a", // b", // -> x',
     "decode_into_sh": "echo cHduZWQ= | base64 -d | sh",
     "decode_into_bash_long": "echo x|base64 --decode|bash",
     "decode_file_into_python": "base64 -d payload.b64 | python3",
