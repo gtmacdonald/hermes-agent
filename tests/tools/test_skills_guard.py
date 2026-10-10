@@ -588,6 +588,13 @@ _INDEX_BENIGN = {
     "rm_jsonc_comment": '"rm -rf *": "deny", // Block recursive deletes',
     "rm_trailing_js_comment": "rm -rf node_modules dist // clean",
     "rm_jsonc_comment_after_operands": '"clean": "rm -rf build dist", // removes generated output',
+    # A JSON string closed by `",` before the `//` lets fold markers and arrows open a comment.
+    "rm_jsonc_region_comment": '"rm -rf dist", // #region cleanup',
+    "rm_jsonc_endregion_comment": '"rm -rf dist", // #endregion',
+    "rm_jsonc_arrow_comment": '"rm -rf dist", // <- cleanup',
+    "rm_jsonc_right_arrow_comment": '"rm -rf dist", // -> cleanup',
+    # A number that is not a file-descriptor redirection is comment text too.
+    "rm_jsonc_numbered_comment": '"rm -rf dist", // 2 passes',
 }
 _INDEX_ADVERSARIAL = {
     "real_aws_key": 'aws_access_key_id="' + _AKIA + 'Q3EXAMPLEKEY7ABC"',
@@ -607,6 +614,24 @@ _INDEX_ADVERSARIAL = {
     "rm_double_slash_then_shell_comment": "rm -rf build // # wipe",
     # `//word` cannot be read as a no-space comment: a later `//etc` operand is /etc.
     "rm_later_double_slash_path": "rm -rf build //etc",
+    # A later `//` is a comment only when a word follows it; shell structure after it is not text.
+    "rm_double_slash_then_stderr_redirect": "rm -rf --no-preserve-root build // 2>/dev/null",
+    "rm_double_slash_then_fd_dup": "rm -rf --no-preserve-root build // 2>&1",
+    "rm_double_slash_then_fd_redirect_both": "rm -rf --no-preserve-root build // 2&>/dev/null",
+    "rm_double_slash_then_stdout_redirect": "rm -rf --no-preserve-root build // >/dev/null",
+    "rm_double_slash_then_continuation": "rm -rf --no-preserve-root build // \\",
+    "rm_double_slash_in_command_substitution": "out=$(rm -rf --no-preserve-root build // )",
+    "rm_double_slash_in_backticks": "out=`rm -rf --no-preserve-root build // `",
+    "rm_double_slash_in_sh_c": "sh -c 'rm -rf --no-preserve-root build // '",
+    "rm_double_slash_then_empty_quotes": 'rm -rf --no-preserve-root build // ""',
+    "rm_double_slash_then_option": "rm -rf --no-preserve-root build // -v",
+    "rm_double_slash_then_variable": "rm -rf --no-preserve-root build // $X",
+    # Fold markers and arrows are shell syntax (`#` comment, `>` redirect) outside a JSON string.
+    "rm_double_slash_then_region_marker": "rm -rf --no-preserve-root build // #region",
+    "rm_double_slash_then_arrow_redirect": "rm -rf --no-preserve-root build // -> x",
+    "rm_double_slash_then_fat_arrow_redirect": "rm -rf --no-preserve-root build // => x",
+    # The `",` must sit directly before the `//`, not on an earlier operand.
+    "rm_double_slash_after_unquoted_operand_arrow": 'rm -rf --no-preserve-root "a", b // -> x',
     "decode_into_sh": "echo cHduZWQ= | base64 -d | sh",
     "decode_into_bash_long": "echo x|base64 --decode|bash",
     "decode_file_into_python": "base64 -d payload.b64 | python3",
