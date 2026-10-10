@@ -1027,7 +1027,7 @@ hermes kanban complete t_1234 --result "shipped"    # only the holder completes 
 - **Renewal.** `heartbeat` by the holder extends `claim_expires` to now plus `--ttl`
   (default 900 s) and never shortens a longer claim. A heartbeat that names a claimer
   who does not hold the claim is refused and records nothing; one with no claimer only
-  records the event. Without renewal the dispatcher's stale sweep reclaims the card at
+  records the event, and `--ttl` without a claimer is refused. Without renewal the dispatcher's stale sweep reclaims the card at
   expiry and counts a failure.
 - **Fence.** While a named claim is live, `complete` and `request-review` from anyone
   else are refused with the holder's name. An operator overrides with
