@@ -255,10 +255,13 @@ THREAT_PATTERNS = [
     # install layer (`rm -rf /var/lib/apt/lists/*`, /var/cache/{apt,apk,yum,dnf}). A parent
     # segment inside an exempted root can escape it, so it remains destructive along with every
     # other path rooted at "/". Every operand is checked (`rm -rf /tmp/x /etc`,
-    # `rm -rf --no-preserve-root /`), not only the first. A later bare `//` token is a JS/JSONC
-    # comment opener (`"rm -rf dist", // clean`), not the root; operands after it are still
-    # checked (`rm -rf x // /etc` deletes /etc in a shell). A first-operand `//` is the root.
-    (r'rm\s+-rf\s+((?:[^\s;&|<>#][^\s;&|<>]*\s+)+?)?/(?(1)(?!/(?:\s|$)))(?:'
+    # `rm -rf --no-preserve-root /`), not only the first. A later bare `//` followed by a word
+    # is read as a JS/JSONC comment opener (`"rm -rf dist", // clean`), not the root; operands
+    # after it are still checked (`rm -rf x // /etc` deletes /etc in a shell). A `//` that ends
+    # the command (end of line, `;`/`&&`/`|`, or a shell `#` comment) has no comment text, so
+    # it is an operand and the root (`rm -rf --no-preserve-root build //`); an empty trailing
+    # JSONC comment (`"rm -rf *": "deny", //`) is the accepted cost. A first-operand `//` is the root.
+    (r'rm\s+-rf\s+((?:[^\s;&|<>#][^\s;&|<>]*\s+)+?)?/(?(1)(?!/\s+[^\s;&|<>#]))(?:'
      r'(?!(?:tmp|var/tmp|dev/shm|run|var/lib/apt/lists|var/cache/(?:apt|apk|yum|dnf))(?:\b|/))'
      r'|(?:tmp|var/tmp|dev/shm|run|var/lib/apt/lists|var/cache/(?:apt|apk|yum|dnf))/(?:[^/\s]*/)*\.\.(?=/|[\s;&|]|$))',
      "destructive_root_rm", "critical", "destructive", "recursive delete from root"),
