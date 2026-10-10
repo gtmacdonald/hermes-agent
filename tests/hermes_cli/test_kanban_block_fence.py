@@ -93,3 +93,13 @@ def test_anonymous_claim_without_a_worker_still_blocks(kanban_home):
         tid = kb.create_task(conn, title="cli card", body="x")
         assert kb.claim_task(conn, tid, claimer=kb._claimer_id()) is not None
         assert kb.block_task(conn, tid, reason="stuck") is True
+
+
+def test_block_by_the_holder_names_the_holder_as_actor(kanban_home):
+    """``block --claimer X`` attributes the ``blocked`` event to X, like claim, heartbeat and
+    complete do, not to the short-lived CLI process's host:pid."""
+    tid = _claimed()
+    kc.run_slash(f"block {tid} waiting on input --claimer {OWNER}")
+    with kbc.connect() as conn:
+        blocked = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+    assert blocked and blocked[-1].payload.get("actor") == OWNER

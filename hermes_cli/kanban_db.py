@@ -3122,7 +3122,7 @@ def edit_task(
 
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
-    kind: Optional[str] = None, expected_run_id: Optional[int] = None, force: bool = False,
+    kind: Optional[str] = None, expected_run_id: Optional[int] = None, force: bool = False, actor: Optional[str] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3183,7 +3183,7 @@ def block_task(
             rekind_reason = "no_open_parent"
         new_status, event_kind, set_sql, params, payload = _route_block(
             kind, reason, source_status, prev_kind=_row_get(cur_row, "block_kind"),
-            prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0),
+            prev_recurrences=int(_row_get(cur_row, "block_recurrences") or 0), actor=actor,
         )
         if rekind_reason:
             payload["requested_kind"] = requested_kind
