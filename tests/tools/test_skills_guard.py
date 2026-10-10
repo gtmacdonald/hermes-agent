@@ -396,6 +396,30 @@ class TestScanSkillCached:
         assert "destructive_home_rm" in prov_second.get("rules", [])
         assert second.verdict == "dangerous"
 
+    def test_safe_verdict_cached_before_trailing_double_slash_rule_is_rescanned(self, tmp_path):
+        """A `safe` verdict cached by skills-guard-v9, whose rule read `rm ... // 2>/dev/null` as a
+        comment, must not be served once the rule treats that `//` as the root."""
+        import json
+
+        from tools import skills_guard
+
+        skill_dir = tmp_path / "root-rm"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("---\nname: root-rm\ndescription: x\n---\n", encoding="utf-8")
+        (skill_dir / "install.sh").write_text(
+            "rm -rf --no-preserve-root build // 2>/dev/null\n", encoding="utf-8")
+        cache_dir = tmp_path / "cache"
+        _first, prov = skills_guard.scan_skill_cached(skill_dir, cache_dir=cache_dir)
+        stale = {**prov, "scanner_version": "skills-guard-v9", "verdict": "safe", "findings": [],
+                 "rules": [], "fresh": False}
+        (cache_file,) = cache_dir.glob("*.json")
+        cache_file.write_text(json.dumps(stale), encoding="utf-8")
+
+        result, prov_second = skills_guard.scan_skill_cached(skill_dir, cache_dir=cache_dir)
+        assert prov_second["fresh"] is True
+        assert "destructive_root_rm" in prov_second["rules"]
+        assert result.verdict == "dangerous"
+
     def test_cached_verdict_served_when_scanner_version_unchanged(self, tmp_path):
         """The same scanner version + unchanged content keeps serving the cached verdict
         (the cache stays useful; only a version/content change invalidates)."""
@@ -587,6 +611,17 @@ _INDEX_BENIGN = {
     "bind_all_in_docs": 'CMD ["python", "manage.py", "runserver", "0.0.0.0:8000"]',
     "rm_jsonc_comment": '"rm -rf *": "deny", // Block recursive deletes',
     "rm_trailing_js_comment": "rm -rf node_modules dist // clean",
+    "rm_jsonc_comment_after_operands": '"clean": "rm -rf build dist", // removes generated output',
+    # A JSON string closed by `",` before the `//` lets fold markers and arrows open a comment.
+    "rm_jsonc_region_comment": '"rm -rf dist", // #region cleanup',
+    "rm_jsonc_endregion_comment": '"rm -rf dist", // #endregion',
+    "rm_jsonc_arrow_comment": '"rm -rf dist", // <- cleanup',
+    "rm_jsonc_right_arrow_comment": '"rm -rf dist", // -> cleanup',
+    # A number that is not a file-descriptor redirection is comment text too.
+    "rm_jsonc_numbered_comment": '"rm -rf dist", // 2 passes',
+    # After a closed JSON string, any text is a comment, punctuation-led included.
+    "rm_jsonc_punctuation_comment": '"clean": "rm -rf build", // @todo',
+    "rm_jsonc_parenthesized_comment": '"rm -rf dist", // (optional)',
 }
 _INDEX_ADVERSARIAL = {
     "real_aws_key": 'aws_access_key_id="' + _AKIA + 'Q3EXAMPLEKEY7ABC"',
@@ -598,6 +633,42 @@ _INDEX_ADVERSARIAL = {
     "rm_apt_lookalike": "rm -rf /var/lib/apt/listsX",
     "rm_double_slash_root": "rm -rf //",
     "rm_root_after_comment_token": "rm -rf build // /etc",
+    # A final `//` is an operand, not an empty comment: on GNU/Linux it is the root.
+    "rm_no_preserve_root_trailing_double_slash": "rm -rf --no-preserve-root build //",
+    "rm_trailing_double_slash": "rm -rf build //",
+    "rm_trailing_double_slash_spaces": "rm -rf build //   ",
+    "rm_double_slash_then_terminator": "rm -rf build // && ls",
+    "rm_double_slash_then_shell_comment": "rm -rf build // # wipe",
+    # `//word` cannot be read as a no-space comment: a later `//etc` operand is /etc.
+    "rm_later_double_slash_path": "rm -rf build //etc",
+    # A later `//` is a comment only when a word follows it; shell structure after it is not text.
+    "rm_double_slash_then_stderr_redirect": "rm -rf --no-preserve-root build // 2>/dev/null",
+    "rm_double_slash_then_fd_dup": "rm -rf --no-preserve-root build // 2>&1",
+    "rm_double_slash_then_fd_redirect_both": "rm -rf --no-preserve-root build // 2&>/dev/null",
+    "rm_double_slash_then_stdout_redirect": "rm -rf --no-preserve-root build // >/dev/null",
+    "rm_double_slash_then_continuation": "rm -rf --no-preserve-root build // \\",
+    "rm_double_slash_in_command_substitution": "out=$(rm -rf --no-preserve-root build // )",
+    "rm_double_slash_in_backticks": "out=`rm -rf --no-preserve-root build // `",
+    "rm_double_slash_in_sh_c": "sh -c 'rm -rf --no-preserve-root build // '",
+    "rm_double_slash_then_empty_quotes": 'rm -rf --no-preserve-root build // ""',
+    "rm_double_slash_then_option": "rm -rf --no-preserve-root build // -v",
+    "rm_double_slash_then_variable": "rm -rf --no-preserve-root build // $X",
+    # Fold markers and arrows are shell syntax (`#` comment, `>` redirect) outside a JSON string.
+    "rm_double_slash_then_region_marker": "rm -rf --no-preserve-root build // #region",
+    "rm_double_slash_then_arrow_redirect": "rm -rf --no-preserve-root build // -> x",
+    "rm_double_slash_then_fat_arrow_redirect": "rm -rf --no-preserve-root build // => x",
+    # The `",` must sit directly before the `//`, not on an earlier operand.
+    "rm_double_slash_after_unquoted_operand_arrow": 'rm -rf --no-preserve-root "a", b // -> x',
+    # A `",` that closes a quote opened among the operands is shell, not the end of a JSON string.
+    "rm_double_slash_after_quoted_operand_arrow": 'rm -rf --no-preserve-root "build", // -> x',
+    "rm_double_slash_after_quoted_operand_redirect": 'rm -rf --no-preserve-root "build", // 2>/dev/null',
+    "rm_double_slash_after_two_quoted_commas": 'rm -rf --no-preserve-root a", // b", // -> x',
+    # A backslash-escaped quote is shell text, not the close of a JSON string.
+    "rm_double_slash_after_escaped_quote_semicolon": 'rm -rf --no-preserve-root build\\", // ;',
+    "rm_double_slash_after_escaped_quote_and": 'rm -rf --no-preserve-root build\\", // && ls',
+    "rm_double_slash_after_escaped_quote_comment": 'rm -rf --no-preserve-root build\\", // # wipe',
+    "rm_double_slash_after_escaped_quote_redirect": 'rm -rf --no-preserve-root build\\", // 2>/dev/null',
+    "rm_double_slash_after_escaped_quote_arrow": 'rm -rf --no-preserve-root build\\", // -> x',
     "decode_into_sh": "echo cHduZWQ= | base64 -d | sh",
     "decode_into_bash_long": "echo x|base64 --decode|bash",
     "decode_file_into_python": "base64 -d payload.b64 | python3",
