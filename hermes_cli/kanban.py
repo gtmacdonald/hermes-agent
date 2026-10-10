@@ -207,10 +207,15 @@ def _profile_author() -> str:
 
 
 def _comment_author(args: argparse.Namespace) -> str:
-    """Author of a comment a verb writes: ``--author`` when the verb has it, else the
-    external harness's claimer (``--claimer`` / ``$HERMES_KANBAN_CLAIMER``, so it matches
-    the event ``actor``), else the profile."""
-    return getattr(args, "author", None) or _named_claimer(args) or _profile_author()
+    """Author of a comment a verb writes: ``--author`` when the verb has it, else the event
+    ``actor`` (:func:`kanban_db.resolve_actor`'s order) when it is a named ``<kind>:<id>``
+    holder, else the profile. A ``host:pid`` actor -- an anonymous claim, or a dispatched
+    worker's own lock, which outranks ``$HERMES_KANBAN_CLAIMER`` -- is never an author: the
+    worker speaks as its profile, as its ``kanban_comment`` tool does."""
+    if getattr(args, "author", None):
+        return args.author
+    actor = kb.resolve_actor(getattr(args, "claimer", None))
+    return actor if kb.is_named_claim(actor) else _profile_author()
 
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({

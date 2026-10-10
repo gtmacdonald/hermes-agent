@@ -189,6 +189,37 @@ def test_schedule_reason_comment_author_is_the_claimer(kanban_home, monkeypatch)
     assert comment.author == OWNER
 
 
+def test_worker_with_anonymous_lock_comments_as_the_profile(kanban_home, monkeypatch):
+    """A dispatched worker's lock is the dispatcher's host:pid. It is the actor on the event,
+    but never a comment author: the worker speaks as its profile, like its kanban_comment tool,
+    even when the env also names an external claimer (the worker keeps its own identity)."""
+    tid = _ready_task()
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", kb._claimer_id())
+    monkeypatch.setenv("HERMES_KANBAN_CLAIMER", OWNER)
+    kc.run_slash(f"comment {tid} worker note")
+    assert _comments(tid)[-1].author == kc._profile_author()
+    monkeypatch.delenv("HERMES_KANBAN_CLAIMER")
+    kc.run_slash(f"block {tid} worker blocked")
+    assert _comments(tid)[-1].author == kc._profile_author()
+
+
+def test_named_worker_lock_beats_the_env_claimer(kanban_home, monkeypatch):
+    """A named lock is the acting identity (resolve_actor's order), so the comment and the
+    blocked event name the same holder."""
+    tid = _ready_task()
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", OTHER)
+    monkeypatch.setenv("HERMES_KANBAN_CLAIMER", OWNER)
+    kc.run_slash(f"block {tid} held by the named lock")
+    assert _comments(tid)[-1].author == OTHER == _last_event(tid, "blocked").payload["actor"]
+
+
+def test_explicit_author_beats_a_named_worker_lock(kanban_home, monkeypatch):
+    tid = _ready_task()
+    monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", OTHER)
+    kc.run_slash(f"comment {tid} --author greg from the desk")
+    assert _comments(tid)[-1].author == "greg"
+
+
 @pytest.mark.parametrize("verb, prefix", [("block", "BLOCKED"), ("schedule", "SCHEDULED")])
 def test_block_and_schedule_comment_author_without_claimer_is_the_profile(kanban_home, verb, prefix):
     tid = _ready_task()
