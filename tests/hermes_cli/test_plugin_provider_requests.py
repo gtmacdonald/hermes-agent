@@ -143,3 +143,110 @@ def test_not_signed_in_names_the_sign_in_command(stubs):
     with pytest.raises(ppr.ProviderNotSignedIn, match="hermes auth add openai-codex"):
         _plugin(declares=True).mint(allowed.url)
     assert allowed.seen == []
+
+
+def _allow(monkeypatch, *stubs_):
+    origins, resolve = ppr._PROVIDERS["openai-codex"]
+    extra = {("http", "127.0.0.1", s.server.server_address[1]) for s in stubs_}
+    monkeypatch.setitem(ppr._PROVIDERS, "openai-codex", (origins | extra, resolve))
+
+
+def _pool_only_sign_in(base_url: str):
+    """No singleton sign-in: the resolver falls back to a pool row routed to *base_url*."""
+    (_home() / "auth.json").write_text(json.dumps({"version": 1, "credential_pool": {"openai-codex": [
+        {"id": "row1", "access_token": TOKEN, "base_url": base_url}]}}))
+
+
+def test_pooled_credential_goes_only_to_its_routed_origin(stubs, monkeypatch):
+    routed, _ = stubs
+    elsewhere = _Stub()  # allowlisted too, but not where the pooled key is routed
+    _allow(monkeypatch, elsewhere)
+    _pool_only_sign_in(routed.url + "/v1")
+    plugin = _plugin(declares=True)
+    try:
+        with pytest.raises(PermissionError, match="routes"):
+            plugin.mint(elsewhere.url + "/v1/realtime/client_secrets")
+        assert elsewhere.seen == []
+        result = plugin.mint(routed.url + "/v1/realtime/client_secrets")
+    finally:
+        elsewhere.close()
+    assert result.status == 200
+    assert routed.seen[0]["headers"]["Authorization"] == f"Bearer {TOKEN}"
+
+
+def _write_module(path: Path, manifest_dir: Path, manifest: str) -> object:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    (manifest_dir / "plugin.yaml").write_text(manifest)
+    path.write_text(
+        "from hermes_cli.plugin_provider_requests import credentialed_provider_request\n"
+        "def mint(url):\n"
+        "    return credentialed_provider_request('openai-codex', 'POST', url, json={})\n")
+    spec = importlib.util.spec_from_file_location(f"plugin_mod_{abs(hash(str(path)))}", path)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_nested_manifest_cannot_grant_what_the_installed_manifest_does_not(stubs):
+    allowed, _ = stubs
+    _sign_in()
+    root = _home() / "plugins" / "sneaky"
+    (root).mkdir(parents=True)
+    (root / "plugin.yaml").write_text("name: sneaky\n")  # the installed manifest declares nothing
+    mod = _write_module(root / "dashboard" / "plugin_api.py", root / "dashboard",
+                        "name: sneaky-nested\nrequires_auth: [openai-codex]\n")
+    with pytest.raises(PermissionError, match="requires_auth"):
+        mod.mint(allowed.url)
+    assert allowed.seen == []
+
+
+def test_category_plugin_is_attributed_to_its_own_manifest(stubs):
+    allowed, _ = stubs
+    _sign_in()
+    owner = _home() / "plugins" / "voices" / "live"
+    mod = _write_module(owner / "sub" / "api.py", owner, "name: live\nrequires_auth: [openai-codex]\n")
+    assert mod.mint(allowed.url).status == 200
+    assert allowed.seen[0]["headers"]["Authorization"] == f"Bearer {TOKEN}"
+
+
+def _dangling_json(cat: Path) -> None:
+    cat.mkdir(parents=True, exist_ok=True)
+    (cat / "plugin.json").symlink_to(cat / "missing-target.json")
+
+
+def _dir_named(name: str):
+    def make(cat: Path) -> None:
+        (cat / name).mkdir(parents=True, exist_ok=True)
+    return make
+
+
+# Layouts the verifier probed: code with its own declaring plugin.yaml in a directory discovery
+# (``scan_directory``) never returns. Discovery loads nothing there, so the token must not go out.
+_NOT_LOADED = {
+    "dangling plugin.json symlink in category": ("cat/inner", _dangling_json),
+    "plugin.json directory in category": ("cat/inner", _dir_named("plugin.json")),
+    "plugin.yaml directory in category": ("cat/inner", _dir_named("plugin.yaml")),
+    "dunder top-level dir": ("__hidden__", None),
+    "foreign-harness top-level dir": (".claude-plugin", None),
+    "foreign-harness dir in category": ("cat/.codex-plugin", None),
+    "dunder dir in category": ("cat/__x__", None),
+}
+
+
+@pytest.mark.parametrize("rel, prepare_category", list(_NOT_LOADED.values()), ids=list(_NOT_LOADED))
+def test_code_discovery_would_not_load_gets_no_token(stubs, rel, prepare_category):
+    from hermes_cli.plugins_discovery import scan_directory
+
+    allowed, _ = stubs
+    _sign_in()
+    plugins = _home() / "plugins"
+    owner = plugins / rel
+    if prepare_category is not None:
+        prepare_category(owner.parent)
+    mod = _write_module(owner / "api.py", owner, "name: probe\nrequires_auth: [openai-codex]\n")
+    assert not any(Path(m.path) == owner for m in scan_directory(plugins, "user"))  # discovery agrees
+    with pytest.raises(PermissionError, match="installed plugin"):
+        mod.mint(allowed.url)
+    assert allowed.seen == []

@@ -395,16 +395,29 @@ returns a `ProviderResponse` (`status`, `headers`, `body`, `.text`, `.json()`).
 The rules:
 
 - **Declared plugins only.** The caller is the plugin whose file is on the call
-  stack. Hermes finds it under the plugins directory and reads its
-  `plugin.yaml`. A plugin that does not list the provider in `requires_auth`,
-  and code outside any installed plugin, gets `PermissionError`. Call the helper
+  stack. Hermes attributes that file to the plugin directory that discovery
+  itself returns for it (`plugins/<name>/`, or `plugins/<category>/<name>/`) and
+  reads that plugin's `plugin.yaml`; a `plugin.yaml` nested deeper inside the
+  plugin is ignored. A plugin that does not list the provider in
+  `requires_auth`, and code under a plugins root that is not in a directory
+  discovery's `scan_directory` returns (for example `__pycache__`-style dunder
+  directories, other harnesses' `.claude-plugin`-style directories, or a
+  category whose own manifest entry is unusable), gets `PermissionError`. This
+  is scan-level, not load-level: a directory `scan_directory` returns but the
+  loader later drops (an impostor that reuses a bundled plugin's name, a
+  duplicate name that loses to another directory, a plugin disabled in config)
+  is still attributed by its own manifest. Code outside every plugins root
+  (project plugins, entry-point plugins) is skipped on the stack, so it runs
+  under the nearest plugin frame below it (a frame under a plugins root), and that frame's own manifest decides; there is no fall-through to an outer frame. Call the helper
   from your own function. Handing the bare helper to `run_in_executor` leaves no
   plugin frame on the stack, so the call is refused.
 - **Provider origins only.** For `openai-codex` the token is sent only to
   `https://chatgpt.com` and `https://api.openai.com`. Any other URL raises
-  `PermissionError` before a request is made. A profile whose Codex credential
-  routes to a custom gateway is refused too, because that key belongs to the
-  gateway.
+  `PermissionError` before a request is made. Only the profile's own ChatGPT
+  sign-in may go to both origins. A pooled Codex credential, or one rerouted
+  with `HERMES_CODEX_BASE_URL`, goes only to the origin it is routed to, and a
+  credential routed to a custom gateway is refused outright, because that key
+  belongs to the gateway.
 - **No redirects.** A 3xx response comes back as-is and is never followed, so
   the header cannot reach a third host.
 - **Profile-scoped.** The credential is the active profile's Codex sign-in, the

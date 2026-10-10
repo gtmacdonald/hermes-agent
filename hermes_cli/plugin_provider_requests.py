@@ -8,8 +8,8 @@ Hermes resolves the credential through its own locked-refresh path, attaches ``A
 itself, sends only to that provider's origins, never follows a redirect, and hands back
 status, headers and body.
 
-The caller is identified by file location: the nearest stack frame inside an installed plugin
-directory. Like capabilities this is consent and visibility, not a sandbox. In-process plugin code
+The caller is identified by file location: the nearest stack frame under a plugins directory,
+attributed to the plugin directory discovery itself returns for that file. Like capabilities this is consent and visibility, not a sandbox. In-process plugin code
 can still read any file the user can.
 """
 
@@ -42,12 +42,20 @@ class ProviderResponse:
         return _json.loads(self.body)
 
 
-def _codex_auth(url: str) -> tuple[dict[str, str], str]:
-    """``(auth headers, credential base URL)`` from Hermes's own locked-refresh resolver."""
+def _codex_auth(url: str, origins: frozenset) -> tuple[dict[str, str], frozenset]:
+    """``(auth headers, origins this credential may be sent to)`` from Hermes's locked-refresh resolver.
+
+    Only the profile's own ChatGPT sign-in (the Hermes auth store, routed to the canonical Codex
+    backend) may cross between the provider's origins: core's Codex chat backend is chatgpt.com
+    (``DEFAULT_CODEX_BASE_URL``), and that OAuth access token is what hermes-live-voice uses to mint
+    an OpenAI Realtime client secret at api.openai.com (commit 4070f011a2; the
+    ``website/docs/developer-guide/plugins`` example). Every other credential is pinned to the
+    origin of its routed base URL: a pooled row (gateway key, api.openai.com key, or OAuth row) and
+    a sign-in rerouted by ``HERMES_CODEX_BASE_URL`` belong to that host only (#121486)."""
     from agent.codex_headers import codex_account_headers
     from agent.turn_failure_copy import oauth_relogin_command
     from hermes_cli.auth_codex import resolve_codex_runtime_credentials
-    from hermes_cli.auth_constants import AuthError
+    from hermes_cli.auth_constants import DEFAULT_CODEX_BASE_URL, AuthError
 
     try:
         creds = resolve_codex_runtime_credentials()
@@ -62,18 +70,26 @@ def _codex_auth(url: str) -> tuple[dict[str, str], str]:
             "or sign in to OpenAI Codex under Providers in the Hermes desktop app.")
     headers = codex_account_headers(token) if url_origin(url)[1] == "chatgpt.com" else {}
     headers["Authorization"] = f"Bearer {token}"
-    return headers, str(creds.get("base_url") or "")
+    route = url_origin(str(creds.get("base_url") or ""))
+    if route not in origins:
+        return headers, frozenset()  # a custom endpoint's key: none of the provider's origins
+    own_sign_in = creds.get("source") != "credential_pool" and route == url_origin(DEFAULT_CODEX_BASE_URL)
+    return headers, origins if own_sign_in else frozenset({route})
 
 
 # provider -> (origins its token may be sent to, auth resolver). chatgpt.com is the Codex backend
 # core itself calls; api.openai.com hosts the Realtime client-secret endpoint Codex clients use.
-_PROVIDERS: dict[str, tuple[frozenset, Callable[[str], tuple[dict[str, str], str]]]] = {
+# The resolver narrows the origins to the ones the resolved credential itself may reach.
+_PROVIDERS: dict[str, tuple[frozenset, Callable[[str, frozenset], tuple[dict[str, str], frozenset]]]] = {
     "openai-codex": (frozenset({("https", "chatgpt.com", 443), ("https", "api.openai.com", 443)}), _codex_auth),
 }
 
 
 def _calling_plugin_dir() -> Optional[Path]:
-    """Directory of the plugin whose code is nearest on the calling stack, or None."""
+    """Directory of the installed plugin whose code is nearest on the calling stack, or None.
+
+    The nearest frame under a plugins root decides: when no discovered plugin owns it, the call is
+    refused rather than attributed to a plugin further up the stack."""
     from hermes_cli.plugins import get_bundled_plugins_dir
     from hermes_constants import get_default_hermes_root, get_hermes_home, get_process_hermes_home
 
@@ -83,18 +99,32 @@ def _calling_plugin_dir() -> Optional[Path]:
     frame = sys._getframe(2)
     while frame is not None:
         raw = Path(frame.f_code.co_filename)
+        in_root = False
         for path in (raw.absolute(), raw.resolve()):
-            root = next((r for r in roots if path.is_relative_to(r) and path != r), None)
-            if root is None:
-                continue
-            for parent in path.parents:
-                if parent == root:
-                    break
-                if (parent / "plugin.yaml").is_file() or (parent / "plugin.yml").is_file():
-                    return parent
-            return root / path.relative_to(root).parts[0]
+            for root in (r for r in roots if path.is_relative_to(r) and path != r):
+                in_root = True
+                owner = _owning_plugin_dir(root, path)
+                if owner is not None:
+                    return owner
+        if in_root:
+            return None
         frame = frame.f_back
     return None
+
+
+def _owning_plugin_dir(root: Path, path: Path) -> Optional[Path]:
+    """The plugin directory under *root* that owns *path*: one of the directories discovery's own
+    ``scan_directory(root)`` returns, so whatever discovery skips gets no credential either (dunder
+    and foreign-harness directories, and a directory whose manifest entry is present but unusable,
+    such as a dangling ``plugin.json`` symlink, which also stops discovery from descending into it).
+    Discovery never descends into a directory it returned, so at most one contains *path*, and a
+    ``plugin.yaml`` nested inside a plugin never stands in for the installed one. A portable
+    ``plugin.json`` package owns its tree but has no native manifest, so it declares no
+    ``requires_auth`` and is refused."""
+    from hermes_cli.plugins_discovery import scan_directory
+
+    return next((Path(m.path) for m in scan_directory(root, "user")
+                 if m.path and path.is_relative_to(Path(m.path))), None)
 
 
 def declared_auth_providers(manifest: Mapping[str, Any]) -> list[str]:
@@ -140,10 +170,12 @@ def credentialed_provider_request(
             f"Plugin '{plugin_dir.name}' must declare `requires_auth: [{provider}]` in plugin.yaml")
     if url_origin(url) not in origins:
         raise PermissionError(f"Refusing to send the {provider} sign-in to {url_origin(url)[1] or url!r}")
-    auth_headers, credential_base = resolve(url)
-    if url_origin(credential_base) not in origins:
-        # A pooled gateway key belongs to its own host only (#121486).
-        raise PermissionError(f"This profile's {provider} credential routes to a custom endpoint; refusing")
+    auth_headers, credential_origins = resolve(url, origins)
+    if url_origin(url) not in credential_origins:
+        # A pooled or rerouted key belongs to its routed host only (#121486).
+        raise PermissionError(
+            f"This profile's {provider} credential routes to another endpoint than "
+            f"{url_origin(url)[1] or url!r}; refusing")
     sent = {k: v for k, v in (headers or {}).items() if str(k).lower() not in {h.lower() for h in auth_headers}}
     import httpx
 
