@@ -663,6 +663,12 @@ _INDEX_ADVERSARIAL = {
     "rm_double_slash_after_quoted_operand_arrow": 'rm -rf --no-preserve-root "build", // -> x',
     "rm_double_slash_after_quoted_operand_redirect": 'rm -rf --no-preserve-root "build", // 2>/dev/null',
     "rm_double_slash_after_two_quoted_commas": 'rm -rf --no-preserve-root a", // b", // -> x',
+    # A backslash-escaped quote is shell text, not the close of a JSON string.
+    "rm_double_slash_after_escaped_quote_semicolon": 'rm -rf --no-preserve-root build\\", // ;',
+    "rm_double_slash_after_escaped_quote_and": 'rm -rf --no-preserve-root build\\", // && ls',
+    "rm_double_slash_after_escaped_quote_comment": 'rm -rf --no-preserve-root build\\", // # wipe',
+    "rm_double_slash_after_escaped_quote_redirect": 'rm -rf --no-preserve-root build\\", // 2>/dev/null',
+    "rm_double_slash_after_escaped_quote_arrow": 'rm -rf --no-preserve-root build\\", // -> x',
     "decode_into_sh": "echo cHduZWQ= | base64 -d | sh",
     "decode_into_bash_long": "echo x|base64 --decode|bash",
     "decode_file_into_python": "base64 -d payload.b64 | python3",
