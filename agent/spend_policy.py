@@ -41,10 +41,21 @@ def prepare(url, body, *, policy_path=None):
         require(isinstance(spec['providers'], list) and bool(spec['providers']))
         require(all(isinstance(p, str) and p.strip() == p and bool(p) for p in spec['providers']))
         require(date.today() < date.fromisoformat(spec['expires_on']))
+        ceiling = cfg['max_usd_per_million_tokens']
+        require(isinstance(ceiling, (int, float)) and not isinstance(ceiling, bool))
+        require(math.isfinite(ceiling) and ceiling >= 0)
+        if 'price_ceiling' in cfg:
+            # Cached legacy readers consume these equal copies, never independent limits.
+            copies = cfg['price_ceiling']
+            require(isinstance(copies, dict) and set(copies) == {'input_usd_per_million', 'output_usd_per_million'})
+            for value in copies.values():
+                require(isinstance(value, (int, float)) and not isinstance(value, bool))
+                require(math.isfinite(value) and value == ceiling)
         for key in ('input_usd_per_million', 'output_usd_per_million'):
             price = spec[key]
             require(isinstance(price, (int, float)) and not isinstance(price, bool))
-            require(math.isfinite(price) and 0 <= price <= cfg['price_ceiling'][key])
+            require(math.isfinite(price) and price >= 0)
+        require(max(spec['input_usd_per_million'], spec['output_usd_per_million']) <= ceiling)
         require(spec['source'].startswith('https://') and spec['checked_on'])
         require(urlsplit(str(url)).path in spec['paths'])
         require(len(json.dumps(body).encode()) <= limits['max_body_bytes'])
@@ -79,7 +90,19 @@ def prepare(url, body, *, policy_path=None):
             raise SpendDenied('model spend policy denied: caller provider options')
         if gw.get('only') and not set(gw['only']).issubset(spec['providers']):
             raise SpendDenied('provider override outside verified provider set')
-    if spec.get('evaluation'):
+    decisions = (name == 'openai-platform-disabled' and urlsplit(str(url)).path == '/v1/decisions')
+    if name == 'openai-platform-disabled':
+        require(spec['providers'] == ['openai'] and not opts and 'provider' not in body)
+        require(not spec.get('require_zdr'))  # no invented native retention option
+    if decisions:
+        # Explicit admission only: no chat/gateway parameters on the native API.
+        require(body.get('model') == 'gpt-6-luna' and spec.get('evaluation') == 'decisions')
+        require(spec['providers'] == ['openai'])
+        require(set(body) == {'model', 'input', 'questions'})
+        require(isinstance(body['input'], str) and isinstance(body['questions'], list) and bool(body['questions']))
+        require(not spec.get('require_zdr'))  # no invented native retention option
+        return out
+    if spec.get('evaluation') and name != 'openai-platform-disabled':
         if 'state' not in body or 'questions' not in body:
             raise SpendDenied('Jev is permitted only through its evaluation API')
     else:
@@ -108,6 +131,9 @@ def prepare(url, body, *, policy_path=None):
             caps[key] = min(value, caps[key])
         out['provider'] = {**provider, 'only': provider.get('only') or spec['providers'], 'allow_fallbacks': False,
                            'max_price': caps}
+    elif name == 'openai-platform-disabled':
+        require(urlsplit(str(url)).path == '/v1/responses')
+        require('max_tokens' not in out and 'max_completion_tokens' not in out)
     elif not spec.get('evaluation'):
         if 'provider' in out:
             raise SpendDenied('caller provider override denied')
