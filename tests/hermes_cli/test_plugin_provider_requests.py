@@ -209,3 +209,44 @@ def test_category_plugin_is_attributed_to_its_own_manifest(stubs):
     mod = _write_module(owner / "sub" / "api.py", owner, "name: live\nrequires_auth: [openai-codex]\n")
     assert mod.mint(allowed.url).status == 200
     assert allowed.seen[0]["headers"]["Authorization"] == f"Bearer {TOKEN}"
+
+
+def _dangling_json(cat: Path) -> None:
+    cat.mkdir(parents=True, exist_ok=True)
+    (cat / "plugin.json").symlink_to(cat / "missing-target.json")
+
+
+def _dir_named(name: str):
+    def make(cat: Path) -> None:
+        (cat / name).mkdir(parents=True, exist_ok=True)
+    return make
+
+
+# Layouts the verifier probed: code with its own declaring plugin.yaml in a directory discovery
+# (``scan_directory``) never returns. Discovery loads nothing there, so the token must not go out.
+_NOT_LOADED = {
+    "dangling plugin.json symlink in category": ("cat/inner", _dangling_json),
+    "plugin.json directory in category": ("cat/inner", _dir_named("plugin.json")),
+    "plugin.yaml directory in category": ("cat/inner", _dir_named("plugin.yaml")),
+    "dunder top-level dir": ("__hidden__", None),
+    "foreign-harness top-level dir": (".claude-plugin", None),
+    "foreign-harness dir in category": ("cat/.codex-plugin", None),
+    "dunder dir in category": ("cat/__x__", None),
+}
+
+
+@pytest.mark.parametrize("rel, prepare_category", list(_NOT_LOADED.values()), ids=list(_NOT_LOADED))
+def test_code_discovery_would_not_load_gets_no_token(stubs, rel, prepare_category):
+    from hermes_cli.plugins_discovery import scan_directory
+
+    allowed, _ = stubs
+    _sign_in()
+    plugins = _home() / "plugins"
+    owner = plugins / rel
+    if prepare_category is not None:
+        prepare_category(owner.parent)
+    mod = _write_module(owner / "api.py", owner, "name: probe\nrequires_auth: [openai-codex]\n")
+    assert not any(Path(m.path) == owner for m in scan_directory(plugins, "user"))  # discovery agrees
+    with pytest.raises(PermissionError, match="installed plugin"):
+        mod.mint(allowed.url)
+    assert allowed.seen == []

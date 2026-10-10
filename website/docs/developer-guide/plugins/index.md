@@ -395,11 +395,14 @@ returns a `ProviderResponse` (`status`, `headers`, `body`, `.text`, `.json()`).
 The rules:
 
 - **Declared plugins only.** The caller is the plugin whose file is on the call
-  stack. Hermes finds the installed plugin that owns that file the way discovery
-  does (`plugins/<name>/`, or `plugins/<category>/<name>/`) and reads that
-  plugin's `plugin.yaml`; a `plugin.yaml` nested deeper inside the plugin is
-  ignored. A plugin that does not list the provider in `requires_auth`,
-  and code outside any installed plugin, gets `PermissionError`. Call the helper
+  stack. Hermes attributes that file to the plugin directory that discovery
+  itself returns for it (`plugins/<name>/`, or `plugins/<category>/<name>/`) and
+  reads that plugin's `plugin.yaml`; a `plugin.yaml` nested deeper inside the
+  plugin is ignored. A plugin that does not list the provider in
+  `requires_auth`, and code that discovery would not load (outside any plugin,
+  or under a directory discovery skips, such as `__pycache__`-style dunder
+  directories, other harnesses' `.claude-plugin`-style directories, or a
+  category whose own manifest entry is unusable), gets `PermissionError`. Call the helper
   from your own function. Handing the bare helper to `run_in_executor` leaves no
   plugin frame on the stack, so the call is refused.
 - **Provider origins only.** For `openai-codex` the token is sent only to

@@ -8,8 +8,8 @@ Hermes resolves the credential through its own locked-refresh path, attaches ``A
 itself, sends only to that provider's origins, never follows a redirect, and hands back
 status, headers and body.
 
-The caller is identified by file location: the nearest stack frame inside an installed plugin
-directory. Like capabilities this is consent and visibility, not a sandbox. In-process plugin code
+The caller is identified by file location: the nearest stack frame under a plugins directory,
+attributed to the plugin directory discovery itself returns for that file. Like capabilities this is consent and visibility, not a sandbox. In-process plugin code
 can still read any file the user can.
 """
 
@@ -86,7 +86,10 @@ _PROVIDERS: dict[str, tuple[frozenset, Callable[[str, frozenset], tuple[dict[str
 
 
 def _calling_plugin_dir() -> Optional[Path]:
-    """Directory of the plugin whose code is nearest on the calling stack, or None."""
+    """Directory of the installed plugin whose code is nearest on the calling stack, or None.
+
+    The nearest frame under a plugins root decides: when no discovered plugin owns it, the call is
+    refused rather than attributed to a plugin further up the stack."""
     from hermes_cli.plugins import get_bundled_plugins_dir
     from hermes_constants import get_default_hermes_root, get_hermes_home, get_process_hermes_home
 
@@ -96,28 +99,32 @@ def _calling_plugin_dir() -> Optional[Path]:
     frame = sys._getframe(2)
     while frame is not None:
         raw = Path(frame.f_code.co_filename)
+        in_root = False
         for path in (raw.absolute(), raw.resolve()):
-            root = next((r for r in roots if path.is_relative_to(r) and path != r), None)
-            if root is not None:
-                return _owning_plugin_dir(root, path.relative_to(root).parts)
+            for root in (r for r in roots if path.is_relative_to(r) and path != r):
+                in_root = True
+                owner = _owning_plugin_dir(root, path)
+                if owner is not None:
+                    return owner
+        if in_root:
+            return None
         frame = frame.f_back
     return None
 
 
-def _has_manifest(directory: Path) -> bool:
-    return any((directory / name).is_file() for name in ("plugin.yaml", "plugin.yml", "plugin.json"))
+def _owning_plugin_dir(root: Path, path: Path) -> Optional[Path]:
+    """The plugin directory under *root* that owns *path*: one of the directories discovery's own
+    ``scan_directory(root)`` returns, so whatever discovery skips gets no credential either (dunder
+    and foreign-harness directories, and a directory whose manifest entry is present but unusable,
+    such as a dangling ``plugin.json`` symlink, which also stops discovery from descending into it).
+    Discovery never descends into a directory it returned, so at most one contains *path*, and a
+    ``plugin.yaml`` nested inside a plugin never stands in for the installed one. A portable
+    ``plugin.json`` package owns its tree but has no native manifest, so it declares no
+    ``requires_auth`` and is refused."""
+    from hermes_cli.plugins_discovery import scan_directory
 
-
-def _owning_plugin_dir(root: Path, parts: tuple[str, ...]) -> Path:
-    """The installed plugin that owns ``root/<parts>``, by discovery's own rule (``scan_directory``):
-    ``root/<name>`` when it has a manifest, else the category layout ``root/<cat>/<name>``. Resolved
-    top-down, so a ``plugin.yaml`` nested inside a plugin can never stand in for the installed one.
-    A portable ``plugin.json`` package owns its tree but has no native manifest, so it declares no
-    ``requires_auth`` and is refused; so is code under a directory discovery would not load."""
-    flat = root / parts[0]
-    if len(parts) > 2 and not _has_manifest(flat) and _has_manifest(flat / parts[1]):
-        return flat / parts[1]
-    return flat
+    return next((Path(m.path) for m in scan_directory(root, "user")
+                 if m.path and path.is_relative_to(Path(m.path))), None)
 
 
 def declared_auth_providers(manifest: Mapping[str, Any]) -> list[str]:
