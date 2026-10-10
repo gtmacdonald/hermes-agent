@@ -1114,7 +1114,8 @@ def _cmd_block(args: argparse.Namespace) -> int:
 
         op = _commented(conn, reason, author, "BLOCKED", _fenced(
             conn, "block", _named_claimer(args), fail_msg, lambda tid, run_id: kb.block_task(
-                conn, tid, reason=reason, kind=kind, expected_run_id=run_id, force=bool(getattr(args, "force", False)))))
+                conn, tid, reason=reason, kind=kind, expected_run_id=run_id,
+                force=bool(getattr(args, "force", False)), actor=getattr(args, "claimer", None))))
         return _bulk_apply(ids, op, ok_msg, lambda tid: fail_msg.get(tid, f"cannot block {tid}"))
 
 

@@ -12,7 +12,7 @@ from typing import Optional
 
 def _route_block(
     kind: Optional[str], reason: Optional[str], source_status: str, *,
-    prev_kind: Optional[str], prev_recurrences: int,
+    prev_kind: Optional[str], prev_recurrences: int, actor: Optional[str] = None,
 ) -> tuple[str, str, str, tuple, dict]:
     """``(new_status, event_kind, set_sql, params, payload)`` for :func:`block_task`.
 
@@ -26,13 +26,19 @@ def _route_block(
     incoming one means blocked -> unblocked -> re-block for the same cause
     (un-typed None compares equal to a prior un-typed block). At
     ``BLOCK_RECURRENCE_LIMIT`` the task routes to ``triage`` for a human.
+    ``actor`` (the caller's ``--claimer``) names who blocked; without it one is
+    resolved here (``kanban_db_claims.resolve_actor``), so ``dependency_wait`` and
+    ``block_loop_detected`` -- kinds the event store does not attribute -- name an
+    actor exactly as ``blocked`` does.
     """
-    payload = {"reason": reason, "kind": kind, "source_status": source_status}
+    actor = _kb.resolve_actor(actor)
+    payload = {"reason": reason, "kind": kind, "source_status": source_status, "actor": actor}
     if kind == "dependency":
         return "todo", "dependency_wait", "block_kind    = ?", (kind,), payload
     recurrences = prev_recurrences + 1 if prev_kind == kind else 1
     set_sql = "block_kind    = ?,\n                       block_recurrences = ?"
-    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status}
+    payload = {"reason": reason, "kind": kind, "recurrences": recurrences, "source_status": source_status,
+               "actor": actor}
     if recurrences >= _kb.BLOCK_RECURRENCE_LIMIT:
         payload["limit"] = _kb.BLOCK_RECURRENCE_LIMIT
         return "triage", "block_loop_detected", set_sql, (kind, recurrences), payload
