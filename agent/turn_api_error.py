@@ -15,6 +15,7 @@ import ssl
 import time
 from typing import Any, Dict, Optional
 
+from agent.anthropic_endpoints import is_native_anthropic_platform
 from agent.api_error_summary import is_provider_stream_parse_error
 from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
 from agent.turn_overflow import recover_from_overflow
@@ -47,6 +48,25 @@ class ApiErrorVerdict:
     compression_attempts: Any
     _provider_overflow_recovery_pending: Any
     result: Optional[dict[str, Any]] = None
+
+
+ANTHROPIC_BILLING_STOP_MESSAGE = (
+    "Anthropic Platform balance is depleted. This turn stopped without automatic provider fallback. "
+    "Explicitly select an existing supported subscription harness to continue."
+)
+
+
+def anthropic_billing_stop(classified: Any, provider: Any, base_url: Any, *, messages: Any,
+                           api_call_count: Any) -> Optional[dict[str, Any]]:
+    """Turn result that ends the turn on a native Anthropic Platform billing failure, else None.
+
+    Fork-local spending policy: no credential-pool rotation, retry, or metered fallback hop."""
+    if classified.reason != FailoverReason.billing or not is_native_anthropic_platform(provider, base_url):
+        return None
+    return {"final_response": ANTHROPIC_BILLING_STOP_MESSAGE, "messages": messages,
+            "api_calls": api_call_count, "completed": False, "failed": True,
+            "error": ANTHROPIC_BILLING_STOP_MESSAGE, "failure_reason": "billing",
+            "failure_retryable": False, "subscription_handoff_required": True}
 
 
 def handle_api_error(
@@ -128,6 +148,13 @@ def handle_api_error(
         retry_count=retry_count, max_retries=max_retries, retryable=classified.retryable,
         reason=classified.reason.value,
     )
+
+    # Fork-local spending policy: native Anthropic may use existing balance, then stops for an
+    # explicit subscription-harness handoff before any pool rotation or fallback hop.
+    stop = anthropic_billing_stop(classified, getattr(agent, "provider", ""), getattr(agent, "base_url", ""),
+                                  messages=messages, api_call_count=api_call_count)
+    if stop is not None:
+        return _verdict("return", stop)
 
     _recovered, recovered_with_pool = recover_after_classification(
         agent, api_error, classified, _retry, status_code=status_code, error_context=error_context,
@@ -272,6 +299,10 @@ def settle_unrecovered_error(
             action=action, active_system_prompt=active_system_prompt, retry_count=retry_count,
             compression_attempts=compression_attempts, result=result,
         )
+
+    stop = anthropic_billing_stop(classified, _provider, _base, messages=messages, api_call_count=api_call_count)
+    if stop is not None:
+        return _verdict("return", stop)
 
     # ``FailoverReason.billing`` (402) is deliberately NOT excluded: pool rotation and
     # eager fallback already gave up, so retrying only burns paid requests on a depleted

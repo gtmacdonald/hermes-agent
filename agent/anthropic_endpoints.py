@@ -25,6 +25,17 @@ def _normalized_lower(base_url) -> str:
     return _normalize_base_url_text(base_url).rstrip("/").lower()
 
 
+def is_native_anthropic_platform(provider, base_url) -> bool:
+    """The metered Anthropic Platform itself. A configured base URL decides by its host
+    (``api.anthropic.com``), so provider ``anthropic`` routed through a third-party gateway is
+    not native; without one, provider ``anthropic`` means the default native endpoint.
+    Fork-local spending policy keys its no-fallback billing stop on this."""
+    url = _normalize_base_url_text(base_url)
+    if url:
+        return base_url_host_matches(url, "api.anthropic.com")
+    return provider == "anthropic"
+
+
 def _is_third_party_anthropic_endpoint(base_url: str | None) -> bool:
     """Any non-anthropic.com endpoint (own x-api-key keys; skip OAuth detection). No base_url =
     direct Anthropic API."""
