@@ -612,12 +612,9 @@ def heartbeat_worker(
     task_id: str,
     *,
     note: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
-    actor: Optional[str] = None,
+    expected_run_id: Optional[int] = None, actor: Optional[str] = None,
 ) -> bool:
-    """Record a ``heartbeat`` event (naming its ``actor``) + touch ``last_heartbeat_at``.
-
-    It does not renew a claim: the holder renews with :func:`kanban_db.heartbeat_claim`.
+    """Record a ``heartbeat`` event naming its ``actor`` + touch ``last_heartbeat_at`` (no claim renewal).
 
     Liveness signal orthogonal to the PID check: a worker whose forked child
     (train loop, crawl) is stuck can still have a live Python process.
