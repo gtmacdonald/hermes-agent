@@ -605,6 +605,8 @@ _INDEX_ADVERSARIAL = {
     "rm_trailing_double_slash_spaces": "rm -rf build //   ",
     "rm_double_slash_then_terminator": "rm -rf build // && ls",
     "rm_double_slash_then_shell_comment": "rm -rf build // # wipe",
+    # `//word` cannot be read as a no-space comment: a later `//etc` operand is /etc.
+    "rm_later_double_slash_path": "rm -rf build //etc",
     "decode_into_sh": "echo cHduZWQ= | base64 -d | sh",
     "decode_into_bash_long": "echo x|base64 --decode|bash",
     "decode_file_into_python": "base64 -d payload.b64 | python3",
