@@ -132,10 +132,29 @@ class _KanbanDispatcher:
     def __init__(self, kb: Any, settings: _DispatcherSettings) -> None:
         self.kb = kb
         self.settings = settings
+        from hermes_cli.kanban_ready_cycle import ReadyCycle
+        self.ready_cycle = ReadyCycle(kb)
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
 
+    def _scope(self):
+        from hermes_cli.config import load_config
+        try:
+            config = load_config().get("kanban", {})
+            scope = config.get("dispatch_scope", [])
+            return (scope if isinstance(scope, list) else []) + self.ready_cycle.scopes(config)
+        except Exception:
+            return []
+
     def _board_slugs(self) -> list:
-        return _board_slugs(self.kb)
+        # Do not even open/migrate unrelated board databases during scoped dispatch; boards
+        # with running workers still tick so the reclaim sweeps keep their lifecycle.
+        from hermes_cli.kanban_dispatch_scope import boards_with_running_readonly, reviewed_entries
+        try:
+            scope = self._scope()
+            running = boards_with_running_readonly(self.kb)
+            return [slug for slug in _board_slugs(self.kb) if reviewed_entries(scope, slug) or slug in running]
+        except Exception:
+            return []
 
     def board_db_fingerprint(self, slug: str) -> tuple[str, int | None, int | None]:
         from hermes_cli import kanban_db as _kb
@@ -184,6 +203,12 @@ class _KanbanDispatcher:
         if not self._quarantine_lifted(slug, fingerprint):
             return None
         kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        # Read approved scope live; missing/unreadable scope must never widen claims.
+        try:
+            from hermes_cli.config import load_config
+            kwargs["eligibility_scope"] = self._scope()
+        except Exception:
+            kwargs["eligibility_scope"] = []
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).
@@ -215,33 +240,34 @@ class _KanbanDispatcher:
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
         """Run one dispatch_once per board. Returns (slug, result) pairs."""
+        try:
+            from hermes_cli.config import load_config
+            self.ready_cycle.tick(load_config().get("kanban", {}))
+        except Exception:
+            logger.exception("kanban ready cycle failed; reviewed dispatch remains guarded")
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
     def ready_nonempty(self) -> bool:
-        """Is there a ready+assigned+unclaimed task on ANY board the dispatcher would spawn for?
-
-        Control-plane lanes (e.g. ``orion-cc``) are pulled by terminals via
-        ``claim_task`` and never spawnable — a queue full of those is
-        "correctly idle", not "stuck". The review column is probed only when
-        review dispatch is on (same gate as the dispatcher): a task waiting
-        for a human reviewer is idle, not stuck.
-        """
-        kbd = _kbd()
-        _review_probe = kbd.review_dispatch_enabled()
-        from hermes_cli import kanban_db as _kb
-        with _kb.pin_first_board_resolution():
+        """Only reviewed ready work contributes to dispatcher health telemetry."""
+        from hermes_cli.config import load_config
+        from hermes_cli.kanban_dispatch_scope import reviewed_entries, eligible
+        try:
+            scope = self._scope()
             for slug in self._board_slugs():
-                conn = None
-                try:
-                    conn = _kbc().connect(board=slug)
-                    if kbd.has_spawnable_ready(conn) or (_review_probe and kbd.has_spawnable_review(conn)):
-                        return True
-                except Exception:
+                entries = reviewed_entries(scope, slug)
+                if not entries:
                     continue
+                from hermes_cli import kanban_db as _kb
+                with _kb.pin_first_board_resolution():
+                    conn = _kbc().connect(board=slug)
+                try:
+                    if any(eligible(conn, e) for e in entries):
+                        return True
                 finally:
-                    if conn is not None:
-                        with contextlib.suppress(Exception):
-                            conn.close()
+                    # sqlite3's context manager commits but does not close.
+                    conn.close()
+        except Exception:
+            return False
         return False
 
     def auto_decompose_tick(self, auto_decompose_per_tick: int) -> int:
@@ -250,39 +276,8 @@ class _KanbanDispatcher:
         Runs before dispatch fans out; the per-tick cap keeps a bulk triage
         load from burst-spending the aux LLM. Returns the number decomposed.
         """
-        try:
-            from hermes_cli import kanban_decompose as _decomp
-        except Exception as exc:  # pragma: no cover
-            logger.warning("kanban auto-decompose: import failed (%s); skipping", exc)
-            return 0
-        attempted = 0
-        successes = 0
-        from hermes_cli import kanban_db as _kb
-        with _default_profile_secret_scope(), _kb.pin_first_board_resolution():
-            for slug in self._board_slugs():
-                if attempted >= auto_decompose_per_tick:
-                    break
-                # Pin the board via env for the call: the decomposer connects
-                # with no board kwarg (same pattern as the dashboard specify endpoint).
-                prev_env = os.environ.get("HERMES_KANBAN_BOARD")
-                try:
-                    os.environ["HERMES_KANBAN_BOARD"] = slug
-                    try:
-                        triage_ids = _decomp.list_triage_ids()
-                    except Exception as exc:
-                        logger.debug("kanban auto-decompose: list_triage_ids failed on board %s (%s)", slug, exc)
-                        triage_ids = []
-                    for tid in triage_ids:
-                        if attempted >= auto_decompose_per_tick:
-                            break
-                        attempted += 1
-                        successes += self._decompose_one(_decomp, slug, tid)
-                finally:
-                    if prev_env is None:
-                        os.environ.pop("HERMES_KANBAN_BOARD", None)
-                    else:
-                        os.environ["HERMES_KANBAN_BOARD"] = prev_env
-        return successes
+        # The finite reviewed scope never authorizes generated cards or broad promotion.
+        return 0
 
     @staticmethod
     def _decompose_one(_decomp: Any, slug: str, tid: str) -> int:

@@ -2196,6 +2196,7 @@ def _claim_and_open_run(
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    eligibility_guard=None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2206,6 +2207,9 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Reviewed dispatch checks share the claim transaction: edits cannot race approval.
+        if eligibility_guard is not None and not eligibility_guard(conn):
+            return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
