@@ -3138,8 +3138,6 @@ def block_task(
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused. A live claim
     is only cleared with proof of ownership or ``force`` (:func:`_fence_live_claim`).
-    ``actor`` (the caller's ``--claimer``) names who blocked on every path, the
-    in-place classification included; without it the event store resolves one.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
@@ -3170,8 +3168,7 @@ def block_task(
             if classified != 1:
                 return False
             _append_event(conn, task_id, "blocked", {
-                "kind": kind, "reason": reason, "classified_in_place": True,
-                **({"actor": actor} if actor else {}),
+                "kind": kind, "reason": reason, "classified_in_place": True, **({"actor": actor} if actor else {}),
             })
             return True
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
