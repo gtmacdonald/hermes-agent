@@ -155,7 +155,7 @@ class ReadyCycle:
                     # Manual override never invokes scrub, gateway_key or either hosted judge.
                     r = self.run([str(Path.home()/".local/bin/card-model"), e["task_id"], "--board", e["board"],
                                   "--profile", row["assignee"], "--model", e["model"], "--provider", e["provider"],
-                                  "--apply", "--json"], capture_output=True, text=True, timeout=120)
+                                  "--apply", "--json"], capture_output=True, text=True, encoding="utf-8", timeout=120)
                     receipt["exit_code"] = r.returncode
                     row = candidate(conn, e)
                     if r.returncode != 0 or row is None or row["model_override"] != e["model"] or row["provider_override"] != e["provider"]:
