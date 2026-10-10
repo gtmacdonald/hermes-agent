@@ -103,3 +103,43 @@ def test_block_by_the_holder_names_the_holder_as_actor(kanban_home):
     with kbc.connect() as conn:
         blocked = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
     assert blocked and blocked[-1].payload.get("actor") == OWNER
+
+
+def _park_untyped(tid: str) -> None:
+    """Leave ``tid`` the way the failure breaker does: ``blocked``, no ``block_kind``,
+    no live run, no ``blocked`` event."""
+    with kbc.connect() as conn, kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', block_kind = NULL, current_run_id = NULL, "
+            "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL WHERE id = ?", (tid,))
+
+
+def test_in_place_classification_names_the_claimer_as_actor(kanban_home):
+    """Classifying a breaker-parked card in place (``block --kind K --claimer X`` on an
+    untyped ``blocked`` card) attributes its ``blocked`` event to X too, not to host:pid."""
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="parked card", body="x")
+    _park_untyped(tid)
+    out = kc.run_slash(f"block {tid} needs a decision --kind needs_input --claimer {OWNER}")
+    assert _task(tid).block_kind == "needs_input", out
+    with kbc.connect() as conn:
+        blocked = [e for e in kb.list_events(conn, tid) if e.kind == "blocked"]
+    assert len(blocked) == 1 and blocked[0].payload.get("classified_in_place") is True
+    assert blocked[0].payload.get("actor") == OWNER
+
+
+def test_in_place_classification_library_actor(kanban_home):
+    """The library forwards ``actor`` on the in-place branch; without one it still resolves
+    an actor (host:pid here) rather than leaving the event unattributed."""
+    with kbc.connect() as conn:
+        named = kb.create_task(conn, title="named", body="x")
+        anon = kb.create_task(conn, title="anon", body="x")
+    _park_untyped(named)
+    _park_untyped(anon)
+    with kbc.connect() as conn:
+        assert kb.block_task(conn, named, reason="r", kind="capability", actor=OWNER) is True
+        assert kb.block_task(conn, anon, reason="r", kind="capability") is True
+        by = {t: [e for e in kb.list_events(conn, t) if e.kind == "blocked"][-1].payload["actor"]
+              for t in (named, anon)}
+    assert by[named] == OWNER
+    assert by[anon] == kb._claimer_id()
