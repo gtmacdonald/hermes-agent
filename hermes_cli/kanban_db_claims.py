@@ -121,6 +121,14 @@ def _completed_actor_payload(
     return payload
 
 
+def _fence_live_claim(trow, task_id: str, *, expected_run_id: Optional[int], force: bool) -> None:
+    """The one fence for every verb that clears a running card's claim (complete, block,
+    schedule): raise :class:`LiveClaimError` naming the holder when the claim is live and the
+    caller neither owns its run (``expected_run_id``) nor asked for an operator override (``force``)."""
+    if expected_run_id is None and not force and trow is not None and _claim_is_live(trow):
+        raise LiveClaimError(task_id, holder=trow["claim_lock"])
+
+
 # Late-bound origin namespace (see module docstring); imported LAST so this
 # module is fully populated before ``kanban_db`` imports from it.
 from hermes_cli import kanban_db as _kb

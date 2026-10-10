@@ -1065,11 +1065,27 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
 
 def _commented(conn, reason: Optional[str], author, prefix: str, op):
-    """Wrap a per-task ``op`` so a ``reason`` is first recorded as a ``PREFIX: reason`` comment."""
+    """Wrap a per-task ``op`` so a ``reason`` is recorded as a ``PREFIX: reason`` comment once
+    ``op`` succeeds: a refused block must not leave its reason on a card someone else holds."""
     def run(tid):
-        if reason:
+        done = op(tid)
+        if done and reason:
             kb.add_comment(conn, tid, author, f"{prefix}: {reason}")
-        return op(tid)
+        return done
+    return run
+
+
+def _fenced(conn, verb: str, claimer: Optional[str], fail_msg: dict, op):
+    """Per-task ``op(tid, run_id)`` for a verb that clears a claim: passes the run the caller
+    owns, and turns a live-claim refusal into a message naming the holder."""
+    def run(tid):
+        try:
+            return op(tid, _owned_run_id(conn, tid, claimer))
+        except kb.LiveClaimError as err:
+            holder = f"it is claimed by {err.holder}" if kb.is_named_claim(err.holder) else "a live worker is running it"
+            fail_msg[tid] = (f"cannot {verb} {tid}: {holder}. Act as that holder (--claimer), "
+                             f"`hermes kanban reclaim {tid}` to release it, or re-run with --force.")
+            return False
     return run
 
 
@@ -1079,6 +1095,7 @@ def _cmd_block(args: argparse.Namespace) -> int:
     author = _comment_author(args)
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
@@ -1095,9 +1112,10 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        op = _commented(conn, reason, author, "BLOCKED", _fenced(
+            conn, "block", _named_claimer(args), fail_msg, lambda tid, run_id: kb.block_task(
+                conn, tid, reason=reason, kind=kind, expected_run_id=run_id, force=bool(getattr(args, "force", False)))))
+        return _bulk_apply(ids, op, ok_msg, lambda tid: fail_msg.get(tid, f"cannot block {tid}"))
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
@@ -1105,10 +1123,13 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     author = _comment_author(args)
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
+        op = _commented(conn, reason, author, "SCHEDULED", _fenced(
+            conn, "schedule", _named_claimer(args), fail_msg, lambda tid, run_id: kb.schedule_task(
+                conn, tid, reason=reason, expected_run_id=run_id, force=bool(getattr(args, "force", False)))))
+        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}",
+                           lambda tid: fail_msg.get(tid, f"cannot schedule {tid}"))
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
