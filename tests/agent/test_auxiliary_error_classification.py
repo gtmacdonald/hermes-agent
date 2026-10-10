@@ -31,6 +31,18 @@ def test_openrouter_limit_403_is_billing_for_main_loop_and_aux_ladder(body):
     assert all(p in ac._PAYMENT_KEYWORDS for p in classify_api_error.__globals__["_BILLING_PATTERNS"])
 
 
+def test_billing_body_on_400_is_payment_error_but_plain_400_is_not():
+    # Anthropic Platform reports a depleted balance as a 400, not a 402.
+    depleted = _Err("Error code: 400 - {'type': 'error', 'error': {'type': 'invalid_request_error', "
+                    "'message': 'Your credit balance is too low to access the Anthropic API. "
+                    "Please go to Plans & Billing to upgrade or purchase credits.'}}", 400)
+    assert ac._is_payment_error(depleted)
+    assert not ac._is_payment_error(_Err("Error code: 400 - max_tokens: Field required", 400))
+    # Generic payment words in a validation 400 are not exhaustion.
+    assert not ac._is_payment_error(_Err("Error code: 400 - billing_address.country is required", 400))
+    assert not ac._is_payment_error(_Err("Error code: 400 - credits field must be an integer", 400))
+
+
 def test_absent_credentials_quarantine_is_debug_and_names_the_real_reason(caplog):
     ac._reset_aux_unhealthy_cache()
     with caplog.at_level(logging.DEBUG, logger="agent.auxiliary_client"):

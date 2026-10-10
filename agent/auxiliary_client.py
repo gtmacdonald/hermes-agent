@@ -3250,11 +3250,14 @@ _PAYMENT_KEYWORDS = _BILLING_PATTERNS + (
 
 
 def _is_payment_error(exc: Exception) -> bool:
-    """Payment/credit/quota exhaustion: HTTP 402, or a billing/quota body on 403/404/429/no-status."""
+    """Payment/credit/quota exhaustion: HTTP 402, or a proven billing/quota body on 403/404/429/no-status.
+    A 400 needs a specific exhaustion phrase (``_BILLING_PATTERNS``): generic words like "billing"
+    also appear in field-validation 400s (``billing_address.country is required``)."""
     status = getattr(exc, "status_code", None)
+    text = str(exc).lower()
     return status == 402 or (
-        status in {403, 404, 429, None} and _contains_any(str(exc).lower(), _PAYMENT_KEYWORDS)
-    )
+        status in {403, 404, 429, None} and _contains_any(text, _PAYMENT_KEYWORDS)
+    ) or (status == 400 and _contains_any(text, _BILLING_PATTERNS))
 
 
 def _nous_portal_account_has_fresh_paid_access() -> bool:
