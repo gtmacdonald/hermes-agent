@@ -832,3 +832,63 @@ def compute_task_diagnostics(
     severity_idx = {s: i for i, s in enumerate(SEVERITY_ORDER)}
     out.sort(key=lambda d: (-severity_idx.get(d.severity, -1), -(d.last_seen_at or 0)))
     return out
+
+
+# --- Board-level signals for reviewed dispatch (F-039) ---
+
+APPROVAL_EXPIRY_WARNING_SECONDS = 24 * 3600
+
+
+def _duration(seconds: float) -> str:
+    return f"{seconds / 3600:.1f}h" if seconds >= 3600 else f"{max(1, int(seconds // 60))}m"
+
+
+def compute_dispatch_diagnostics(board: str, waiting: list, admitted: list, *, now: Optional[int] = None,
+                                 expiry_warning_seconds: int = APPROVAL_EXPIRY_WARNING_SECONDS,
+                                 ) -> list[Diagnostic]:
+    """Board-wide diagnostics for reviewed dispatch, from
+    :func:`hermes_cli.kanban_dispatch_scope.admission`: ``waiting`` ready card ids the
+    dispatcher could start, ``admitted`` the live approvals admitting any of them.
+
+    ``dispatch_scope_starved`` (error): cards wait and no approval admits one, so the
+    gateway dispatcher starts nothing here. ``approval_expiring`` (warning): a card's
+    last approval lapses within ``expiry_warning_seconds``.
+    """
+    now_ts = int(now if now is not None else time.time())
+    out: list[Diagnostic] = []
+    if waiting and not admitted:
+        n = len(waiting)
+        out.append(Diagnostic(
+            kind="dispatch_scope_starved", severity="error",
+            title=f"{n} ready card(s) waiting; no approval admits any",
+            detail=f"Board {board!r} has {n} ready, unclaimed card(s) assigned to a dispatch profile, "
+                   "but no live reviewed approval in kanban.dispatch_scope or "
+                   "kanban.dispatch_ready_scope admits any of them: the scope is empty or every "
+                   "approval has expired. The gateway dispatcher starts only approved cards, so "
+                   "none of these will start until one is approved.",
+            actions=[_cli_hint("List the waiting cards", f"hermes kanban --board {board} list --status ready",
+                               suggested=True)],
+            first_seen_at=now_ts, last_seen_at=now_ts,
+            data={"board": board, "waiting": n, "task_ids": list(waiting)},
+        ))
+    # A card stays admitted until its last approval lapses.
+    until: dict[str, float] = {}
+    for entry in admitted:
+        until[entry["task_id"]] = max(until.get(entry["task_id"], 0), entry["expires_at"])
+    for task_id, expires_at in sorted(until.items(), key=lambda item: item[1]):
+        left = expires_at - now_ts
+        if not 0 < left <= expiry_warning_seconds:
+            continue
+        out.append(Diagnostic(
+            kind="approval_expiring", severity="warning",
+            title=f"Dispatch approval for {task_id} expires in {_duration(left)}",
+            detail=f"Card {task_id} on board {board!r} is ready and admitted, but its reviewed "
+                   f"approval expires in {_duration(left)}. If no worker has started it by then, "
+                   "the dispatcher will skip it until it is approved again.",
+            actions=[_cli_hint("Inspect the card", f"hermes kanban --board {board} show {task_id}",
+                               suggested=True)],
+            first_seen_at=now_ts, last_seen_at=now_ts,
+            data={"board": board, "task_id": task_id, "expires_at": int(expires_at),
+                  "seconds_left": int(left)},
+        ))
+    return out

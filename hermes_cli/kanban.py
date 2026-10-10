@@ -679,11 +679,22 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     if dl:
                         diags_by_task[tid] = dl
 
+        # Board-wide: ready work the reviewed dispatch scope admits none of (F-039).
+        from hermes_cli.kanban_dispatch_scope import admission
+        board = kb.get_current_board()
+        try:
+            board_diags = kd.compute_dispatch_diagnostics(
+                board, *admission(conn, board, diag_config.get("kanban") or {}, kb))
+        except Exception as exc:  # never lose the per-task diagnostics; say why this part is missing
+            print(f"kanban: dispatch-scope check failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            board_diags = []
+
         sev = getattr(args, "severity", None)
         if sev:
             floor = kd.SEVERITY_ORDER.index(sev)
             diags_by_task = {tid: kept for tid, dl in diags_by_task.items()
                              if (kept := [d for d in dl if kd.SEVERITY_ORDER.index(d.severity) >= floor])}
+            board_diags = [d for d in board_diags if kd.SEVERITY_ORDER.index(d.severity) >= floor]
 
         # Map task_id → title/status/assignee for the table output.
         meta: dict[str, dict] = {}
@@ -697,16 +708,22 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     allowlist = kbd.dispatch_profile_allowlist_summary()
 
     if getattr(args, "json", False):
-        # Per-task rows unchanged; the home-scope allowlist rides as a trailing row
-        # (task_id null) so existing `payload[0]["diagnostics"]` consumers keep working.
+        # Per-task rows unchanged; the home-scope allowlist and board-wide diagnostics ride as a
+        # trailing row (task_id null) so existing `payload[0]["diagnostics"]` consumers keep working.
         _print_json([{"task_id": tid, **meta.get(tid, {}), "diagnostics": [d.to_dict() for d in dl]}
                      for tid, dl in diags_by_task.items()]
-                    + [{"task_id": None, "dispatch_profiles": allowlist, "diagnostics": []}])
+                    + [{"task_id": None, "dispatch_profiles": allowlist,
+                        "diagnostics": [d.to_dict() for d in board_diags]}])
         return 0
 
     print(f"kanban.dispatch_profiles: {allowlist}")
+    if board_diags:
+        print(f"Board {board}:")
+        _print_diagnostics(board_diags, "    ", with_kind=True)
+        print()
     if not diags_by_task:
-        print("No active diagnostics on this board.")
+        if not board_diags:
+            print("No active diagnostics on this board.")
         return 0
 
     total = sum(len(dl) for dl in diags_by_task.values())

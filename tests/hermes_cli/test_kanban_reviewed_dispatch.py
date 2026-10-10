@@ -117,3 +117,111 @@ def test_boards_with_running_work_are_found_read_only(board):
         task_id = kb.create_task(conn, title="In flight")
         conn.execute("UPDATE tasks SET status='running' WHERE id=?", (task_id,))
     assert boards_with_running_readonly(kb) == {board}
+
+
+# --- F-039: say when the reviewed scope admits none of the waiting work ---
+
+def _ready_card(conn, **overrides):
+    fields = dict(title="Waiting work", body="Spec", assignee="professor")
+    fields.update(overrides)
+    task_id = kb.create_task(conn, **fields)
+    conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+    return task_id
+
+
+def test_admission_finds_waiting_cards_no_live_approval_admits(board):
+    from hermes_cli.kanban_dispatch_scope import admission
+    with kbc.connect_closing(board=board) as conn:
+        task_id, entry = _approved_card(conn)
+        _ready_card(conn, assignee="quick")  # scoped dispatch never starts other profiles
+        _ready_card(conn, assignee=None)
+        claimed = _ready_card(conn)
+        conn.execute("UPDATE tasks SET claim_lock='held' WHERE id=?", (claimed,))
+        assert admission(conn, board, {}, kb) == ([task_id], [])
+        expired = dict(entry, expires_at=time.time() - 1)
+        assert admission(conn, board, {"dispatch_scope": [expired]}, kb) == ([task_id], [])
+        assert admission(conn, board, {"dispatch_scope": [entry]}, kb) == ([task_id], [entry])
+
+
+def test_admission_ignores_harness_boards(board):
+    from hermes_cli.kanban_dispatch_scope import admission
+    kb.create_board("claude")
+    with kbc.connect_closing(board="claude") as conn:
+        _ready_card(conn)
+        assert admission(conn, "claude", {}, kb) == ([], [])
+
+
+def test_admission_honours_dispatch_profiles(board, tmp_path):
+    from hermes_cli.kanban_dispatch_scope import admission
+    (tmp_path / "hermes" / "config.yaml").write_text(
+        "kanban:\n  dispatch_profiles: [professor]\n", encoding="utf-8")
+    with kbc.connect_closing(board=board) as conn:
+        professor = _ready_card(conn)
+        _ready_card(conn, assignee="studio")
+        assert admission(conn, board, {}, kb) == ([professor], [])
+
+
+def test_admission_counts_ready_cycle_approvals_until_a_receipt_holds_them(board):
+    from hermes_cli.kanban_dispatch_scope import admission
+    from hermes_cli.kanban_ready_cycle import ReadyCycle, spec_digest
+    with kbc.connect_closing(board=board) as conn:
+        task_id = _ready_card(conn)
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        config = _ready(task_id=task_id, spec_sha256=spec_digest(row))
+        approval = config["dispatch_ready_scope"][0]
+        assert admission(conn, board, config, kb) == ([task_id], [approval])
+        cycle = ReadyCycle(kb)
+        cycle._save(cycle._path(approval), {"state": "held"})
+        assert admission(conn, board, config, kb) == ([task_id], [])
+
+
+def test_starved_boards_are_found_read_only(board):
+    from hermes_cli.kanban_dispatch_scope import starved_boards_readonly
+    for slug in ("approved", "claude", "broken"):
+        kb.create_board(slug)
+    with kbc.connect_closing(board=board) as conn:
+        _ready_card(conn)
+        _ready_card(conn)
+    with kbc.connect_closing(board="approved") as conn:
+        _task_id, entry = _approved_card(conn)
+    with kbc.connect_closing(board="claude") as conn:
+        _ready_card(conn)
+    kb.kanban_db_path(board="broken").write_bytes(b"not a database" * 64)
+    scope = {"dispatch_scope": [dict(entry, board="approved")]}
+    assert starved_boards_readonly(kb, scope) == ({board: 2}, {"broken"})
+
+
+def _diagnostics(json_out, severity=None):
+    import argparse
+    from hermes_cli import kanban as kanban_cli
+    return kanban_cli._cmd_diagnostics(argparse.Namespace(task=None, severity=severity, json=json_out))
+
+
+def test_diagnostics_cli_reports_a_starved_board(board, monkeypatch, capsys):
+    import json
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    with kbc.connect_closing(board=board) as conn:
+        _ready_card(conn)
+    assert _diagnostics(True) == 0
+    row = json.loads(capsys.readouterr().out)[-1]
+    assert row["task_id"] is None
+    assert [(d["kind"], d["severity"]) for d in row["diagnostics"]] == [("dispatch_scope_starved", "error")]
+    assert row["diagnostics"][0]["data"]["waiting"] == 1
+    assert _diagnostics(False) == 0
+    text = capsys.readouterr().out
+    assert "dispatch_scope_starved" in text
+    assert "No active diagnostics" not in text
+
+
+def test_diagnostics_cli_warns_before_an_approval_expires(board, monkeypatch, capsys, tmp_path):
+    import json
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", board)
+    with kbc.connect_closing(board=board) as conn:
+        _task_id, entry = _approved_card(conn)
+    (tmp_path / "hermes" / "config.yaml").write_text(
+        json.dumps({"kanban": {"dispatch_scope": [entry]}}), encoding="utf-8")
+    assert _diagnostics(True) == 0
+    row = json.loads(capsys.readouterr().out)[-1]
+    assert [(d["kind"], d["severity"]) for d in row["diagnostics"]] == [("approval_expiring", "warning")]
+    assert _diagnostics(True, severity="error") == 0
+    assert json.loads(capsys.readouterr().out)[-1]["diagnostics"] == []

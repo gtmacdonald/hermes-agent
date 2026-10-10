@@ -135,13 +135,14 @@ class _KanbanDispatcher:
         from hermes_cli.kanban_ready_cycle import ReadyCycle
         self.ready_cycle = ReadyCycle(kb)
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+        # Boards whose waiting ready work no live approval admits, as last reported (F-039).
+        self.starved_boards: frozenset[str] = frozenset()
 
     def _scope(self):
         from hermes_cli.config import load_config
+        from hermes_cli.kanban_dispatch_scope import effective_scope
         try:
-            config = load_config().get("kanban", {})
-            scope = config.get("dispatch_scope", [])
-            return (scope if isinstance(scope, list) else []) + self.ready_cycle.scopes(config)
+            return effective_scope(load_config().get("kanban", {}), self.ready_cycle)
         except Exception:
             return []
 
@@ -245,7 +246,37 @@ class _KanbanDispatcher:
             self.ready_cycle.tick(load_config().get("kanban", {}))
         except Exception:
             logger.exception("kanban ready cycle failed; reviewed dispatch remains guarded")
-        return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+        results = [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
+        self.report_starvation()
+        return results
+
+    def report_starvation(self) -> None:
+        """Warn once per change when dispatchable ready cards wait and no live approval admits
+        any of them (F-039). ``ready_nonempty`` counts only reviewed work, so the generic
+        "dispatcher stuck" warning never sees this state."""
+        from hermes_cli.config import load_config
+        from hermes_cli import kanban_dispatch_scope as scope
+        try:
+            starved, unreadable = scope.starved_boards_readonly(
+                self.kb, load_config().get("kanban", {}), ready_cycle=self.ready_cycle)
+        except Exception:
+            logger.debug("kanban dispatcher: starvation check failed", exc_info=True)
+            return
+        # An unreadable board keeps its last known state: a transient read error must not flap.
+        state = frozenset(starved) | (self.starved_boards & unreadable)
+        if state == self.starved_boards:
+            return
+        if state:
+            logger.warning(
+                "kanban dispatcher: ready cards assigned to dispatch profiles wait on %s, but no "
+                "live reviewed approval admits any of them (kanban.dispatch_scope / "
+                "dispatch_ready_scope empty or expired); nothing there will start until approved. "
+                "See `hermes kanban --board <board> diagnostics`.",
+                ", ".join(f"{slug}={starved.get(slug, '?')}" for slug in sorted(state)))
+        else:
+            logger.info("kanban dispatcher: reviewed scope admits the waiting ready work again "
+                        "(was starved: %s)", ", ".join(sorted(self.starved_boards)))
+        self.starved_boards = state
 
     def ready_nonempty(self) -> bool:
         """Only reviewed ready work contributes to dispatcher health telemetry."""

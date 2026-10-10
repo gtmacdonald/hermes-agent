@@ -11,7 +11,8 @@ import subprocess
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
-from hermes_cli.kanban_dispatch_scope import FIELDS, HARNESS_BOARDS, task_digest, reviewed_entries
+from hermes_cli.kanban_dispatch_scope import (FIELDS, HARNESS_BOARDS, SCOPED_ASSIGNEES, task_digest,
+                                              reviewed_entries)
 
 
 def spec_digest(row):
@@ -54,7 +55,7 @@ def candidate(conn, entry):
     row = conn.execute("SELECT * FROM tasks WHERE id=?", (entry["task_id"],)).fetchone()
     if row is None or row["status"] != "ready" or row["claim_lock"] is not None:
         return None
-    if row["assignee"] not in {"professor", "studio"} or spec_digest(row) != entry["spec_sha256"]:
+    if row["assignee"] not in SCOPED_ASSIGNEES or spec_digest(row) != entry["spec_sha256"]:
         return None
     if conn.execute("SELECT 1 FROM task_runs WHERE task_id=? LIMIT 1", (entry["task_id"],)).fetchone():
         return None
@@ -75,6 +76,10 @@ class ReadyCycle:
         # Changing a model choice must not erase a failed attempt for the same work.
         key = hashlib.sha256((e["board"] + "\0" + e["task_id"] + "\0" + e["spec_sha256"]).encode()).hexdigest()
         return self.root / (key + ".json")
+
+    def pending(self, e):
+        """No receipt yet: the next cycle may still select this approval."""
+        return not self._path(e).exists()
 
     def _read(self, path):
         try:
@@ -131,7 +136,7 @@ class ReadyCycle:
             if count >= budget:
                 break
             path = self._path(e)
-            if path.exists():
+            if not self.pending(e):
                 continue  # selected, failed, interrupted all require a fresh human review
             conn = kbc.connect(board=e["board"])
             try:
