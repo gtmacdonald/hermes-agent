@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import List, Tuple
 
 
-SCANNER_VERSION = "skills-guard-v9"
+SCANNER_VERSION = "skills-guard-v11"
 
 # NVIDIA-verified skills each ship a signed `skill.oms.sig` + governance `skill-card.md`.
 TRUSTED_REPOS = {"openai/skills", "anthropics/skills", "huggingface/skills", "NVIDIA/skills"}
@@ -255,10 +255,21 @@ THREAT_PATTERNS = [
     # install layer (`rm -rf /var/lib/apt/lists/*`, /var/cache/{apt,apk,yum,dnf}). A parent
     # segment inside an exempted root can escape it, so it remains destructive along with every
     # other path rooted at "/". Every operand is checked (`rm -rf /tmp/x /etc`,
-    # `rm -rf --no-preserve-root /`), not only the first. A later bare `//` token is a JS/JSONC
-    # comment opener (`"rm -rf dist", // clean`), not the root; operands after it are still
-    # checked (`rm -rf x // /etc` deletes /etc in a shell). A first-operand `//` is the root.
-    (r'rm\s+-rf\s+((?:[^\s;&|<>#][^\s;&|<>]*\s+)+?)?/(?(1)(?!/(?:\s|$)))(?:'
+    # `rm -rf --no-preserve-root /`), not only the first. A later bare `//` is read as a JS/JSONC
+    # comment opener (`"rm -rf dist", // clean`), not the root, only when comment text follows:
+    # the next token starts with a letter, or is a number that is not a file-descriptor
+    # redirection (`// 2 passes`, not `// 2>/dev/null`), or the `//` directly follows the close
+    # of a JSON string (`"rm -rf dist", // @todo`) and any text follows. That JSON close counts
+    # only when it is the sole `"` from the operands to the end of the line, so the quote opened
+    # before `rm`; a quoted shell operand (`rm -rf "build", // -> x`) and a backslash-escaped
+    # quote (`rm -rf build\\", // ;`, shell text) do not qualify.
+    # Anything else after the `//` is shell structure, so it is an operand and the root: end of
+    # line, `;`/`&&`/`|`, `#`, a redirection (`2>/dev/null`, `-> x`), a continuation `\`, a
+    # closing `)`, backtick or quote, an option or a `$` expansion. Operands after a comment-like
+    # `//` are still checked (`rm -rf x // /etc` deletes /etc in a shell). A first-operand `//`
+    # is the root.
+    (r'rm\s+-rf\s+(?:(?=(?P<quotes>[^"\n]*"[^"\n]*")))?(?P<ops>(?:[^\s;&|<>#][^\s;&|<>]*\s+)+?)?/'
+     r'(?(ops)(?!/\s+(?:[^\W\d_]|\d+(?![\d<>&]))|(?(quotes)(?!)|(?<=",\s/)(?<!\\",\s/)/\s+\S)))(?:'
      r'(?!(?:tmp|var/tmp|dev/shm|run|var/lib/apt/lists|var/cache/(?:apt|apk|yum|dnf))(?:\b|/))'
      r'|(?:tmp|var/tmp|dev/shm|run|var/lib/apt/lists|var/cache/(?:apt|apk|yum|dnf))/(?:[^/\s]*/)*\.\.(?=/|[\s;&|]|$))',
      "destructive_root_rm", "critical", "destructive", "recursive delete from root"),
