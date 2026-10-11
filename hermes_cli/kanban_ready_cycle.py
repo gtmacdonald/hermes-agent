@@ -95,9 +95,9 @@ class ReadyCycle:
 
     def _route_matches(self, row, e):
         # Verify the profile route still has the reviewed LAN endpoint, before assigning.
-        import hermes_yaml as yaml
+        from hermes_cli.config import read_user_config_raw
         try:
-            cfg = yaml.safe_load((Path(self.kb.kanban_home()) / "profiles" / row["assignee"] / "config.yaml").read_text())
+            cfg = read_user_config_raw(Path(self.kb.kanban_home()) / "profiles" / row["assignee"] / "config.yaml")
             route = cfg.get("providers", {}).get(e["provider"], {})
             return route.get("base_url", "").rstrip("/") == e["endpoint"].rstrip("/") and (
                 e["model"] in route.get("models", {}) or e["model"] == route.get("model"))

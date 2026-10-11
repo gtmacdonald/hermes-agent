@@ -2955,10 +2955,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         strip_launch_profile_env(env, profile_home)
     # A direct private LAN provider is pinned for this worker and its auxiliary calls.
     if profile_home and task.provider_override and task.model_override:
-        import hermes_yaml as yaml
+        from hermes_cli.config import read_user_config_raw
         from hermes_cli.kanban_ready_cycle import approvals
         try:
-            cfg = yaml.safe_load((Path(profile_home) / "config.yaml").read_text()) or {}
+            cfg = read_user_config_raw(Path(profile_home) / "config.yaml")
             route = ((cfg.get("providers") or {}) if isinstance(cfg, dict) else {}).get(task.provider_override) or {}
             endpoint = (route.get("base_url") or "") if isinstance(route, dict) else ""
         except Exception:
