@@ -411,6 +411,19 @@ def apply_config_override(config: dict) -> dict:
     if not refs:
         raise ValueError("Directed personal override has no verified owner reference")
     # Selection/hydration independently verifies identity, expiry and removal.
+    from hermes_cli import managed_scope
+    desired = {"provider": "anthropic", "default": model, "api_mode": "anthropic_messages", "base_url": "https://api.anthropic.com"}
+    existing_model = config.get("model") if isinstance(config.get("model"), dict) else {}
+    managed_keys = managed_scope.managed_config_keys()
+    for key, value in desired.items():
+        if ("model" in managed_keys or f"model.{key}" in managed_keys) and existing_model.get(key) != value:
+            raise ValueError("Personal account override conflicts with managed model settings")
+    for key in ("api_key", "api", "key_env"):
+        if ("model" in managed_keys or f"model.{key}" in managed_keys) and existing_model.get(key):
+            raise ValueError("Personal account override cannot remove managed authentication settings")
+    for key in ("fallback_model", "fallback_providers"):
+        if any(path == key or path.startswith(key + ".") for path in managed_keys) and config.get(key):
+            raise ValueError("Personal account override conflicts with managed fallback settings")
     result = copy.deepcopy(config)
     result["model"] = {**(result.get("model") if isinstance(result.get("model"), dict) else {}), "provider": "anthropic", "default": model,
                        "api_mode": "anthropic_messages", "base_url": "https://api.anthropic.com"}

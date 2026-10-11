@@ -520,3 +520,16 @@ def test_verified_studio_personal_grant_can_service_professor_without_refresh(st
     assert overlay['workgroup']=='professor' and overlay['cwd']=='/Volumes/ACC-Private/synthetic'
     assert overlay['tools']==['synthetic-vault-tool'] and overlay['session_id']=='synthetic'
     assert overlay['fallback_providers']==[]
+
+
+def test_personal_override_cannot_replace_incompatible_managed_route(stores, monkeypatch):
+    from hermes_cli import managed_scope
+    native='claude-opus-5-5'
+    fallback.add_reference(owner='studio',credential_id='studio',models=[native])
+    fallback.configure(active=True,mode='user_override',requested_owner='studio',authorization_reference='synthetic-direct-ruling',native_model=native)
+    monkeypatch.setattr(managed_scope,'managed_config_keys',lambda:{'model.provider','model.default'})
+    with pytest.raises(ValueError,match='managed model'):
+        fallback.apply_config_override({'model':{'provider':'openrouter','default':'anthropic/claude-opus-5.5'}})
+    # Compatible managed route is preserved while the account reference changes.
+    result=fallback.apply_config_override({'model':{'provider':'anthropic','default':native}})
+    assert result['model']['provider']=='anthropic' and result['model']['default']==native
