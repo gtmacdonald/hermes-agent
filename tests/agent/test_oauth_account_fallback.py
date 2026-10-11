@@ -333,7 +333,7 @@ def test_two_processes_refresh_one_owner_generation(stores):
     import subprocess
     import sys
     _, professor, studio = stores
-    ref = quota(cp.load_pool("anthropic"))
+    quota(cp.load_pool("anthropic"))
     path = studio / "auth.json"
     store = json.loads(path.read_text())
     store["credential_pool"]["anthropic"][0]["expires_at_ms"] = 1
