@@ -2074,7 +2074,8 @@ def load_config() -> dict[str, Any]:
     Cached on the file signature; returns a deepcopy since most call sites mutate the result.
     Read-only hot paths should use ``load_config_readonly()`` to skip the deepcopy."""
     from hermes_cli.kanban_worker_bootstrap import local_worker_overlay
-    return local_worker_overlay(_load_config_impl(want_deepcopy=True))
+    from agent.oauth_account_fallback import apply_config_override
+    return local_worker_overlay(apply_config_override(_load_config_impl(want_deepcopy=True)))
 
 
 def load_config_readonly() -> dict[str, Any]:
@@ -2082,7 +2083,8 @@ def load_config_readonly() -> dict[str, Any]:
     **Mutating the returned dict (or any nested structure) corrupts the in-process cache for
     every subsequent caller** — only for code paths that never write to the result."""
     from hermes_cli.kanban_worker_bootstrap import local_worker_overlay
-    return local_worker_overlay(_load_config_impl(want_deepcopy=False))
+    from agent.oauth_account_fallback import apply_config_override
+    return local_worker_overlay(apply_config_override(_load_config_impl(want_deepcopy=False)))
 
 
 def _ensure_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:

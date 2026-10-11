@@ -125,6 +125,24 @@ def candidates(entries, model: str | None):
     entries = [e for e in entries if e.id in by_id]
     own = [e for e in entries if _owned(e.to_dict())]
     inventory = [row for row in rows if _account_row(row)]
+    policy = auth._load_auth_store().get("oauth_account_fallback", {})
+    directed = policy.get("mode") == "user_override" and policy.get("requested_owner") in {"studio", "personal"} and bool(policy.get("authorization_reference"))
+    if directed:
+        # A deliberate operator action, never an inferred error/quota verdict.
+        result = []
+        for entry in entries:
+            if entry.source != SOURCE or entry.extra.get("owner_profile") != policy.get("requested_owner") or model not in entry.extra.get("verified_models", []):
+                continue
+            try:
+                _, _, row = _read_owner(entry)
+                if row.get("last_status") == "dead" or _quota(row, time.time()):
+                    continue
+                if row.get("last_status") == "exhausted" and float(row.get("last_error_reset_at") or float("inf")) > time.time():
+                    continue
+                result.append(entry)
+            except (ValueError, OSError, TypeError):
+                continue
+        return result
     # Unknown accounts block fallback. All OAuth rows count, including same-account
     # aliases, and all must have authoritative identity before admission.
     if not own or not inventory or any(identity(row) is None for row in inventory):
@@ -329,7 +347,7 @@ def verify_pool_account(credential_id: str, *, persist: bool = True):
     return True  # identity stays in the owner store, never emitted
 
 
-def configure(*, active: bool):
+def configure(*, active: bool, mode: str = "automatic_quota", authorization_reference: str | None = None, native_model: str | None = None, requested_owner: str = "personal"):
     """Reversible explicit policy switch, after identity/reference readiness checks."""
     from hermes_cli import auth
     if profile_name_for_home(get_hermes_home()) != "professor":
@@ -340,12 +358,66 @@ def configure(*, active: bool):
         if active:
             owned = [row for row in rows if _account_row(row)]
             refs = [row for row in rows if row.get("source") == SOURCE]
-            if not owned or any(identity(row) is None for row in owned) or not refs:
+            if mode not in {"automatic_quota", "user_override"}:
+                raise ValueError("Unknown account fallback mode")
+            if mode == "user_override":
+                refs = [r for r in refs if r.get("owner_profile") == requested_owner and native_model in r.get("verified_models", [])]
+                if requested_owner not in {"studio", "personal"} or not authorization_reference or not native_model or not refs or any(native_model not in r.get("verified_models", []) for r in refs):
+                    raise ValueError("Personal override requires direct authorization and verified native model references")
+            if mode == "automatic_quota" and (not owned or any(identity(row) is None for row in owned) or not refs):
                 raise ValueError("Policy requires verified Professor accounts and explicit owner references")
             from agent.credential_pool import PooledCredential
             for row in refs:
                 if not row.get("verified_models"):
                     raise ValueError("Owner reference lacks exact model verification")
                 _read_owner(PooledCredential.from_dict("anthropic", row))
-        store["oauth_account_fallback"] = {"version": 1, "enabled": bool(active)}
+        store["oauth_account_fallback"] = {"version": 1, "enabled": bool(active), "mode": mode}
+        if active and mode == "user_override":
+            store["oauth_account_fallback"].update(requested_owner=requested_owner, authorization_reference=authorization_reference,
+                native_model=native_model, runtime_provider="anthropic", runtime_api_mode="anthropic_messages")
         auth._save_auth_store(store)
+
+
+def native_override_route(*, current_provider: str, current_model: str, verified_catalog: list[str]):
+    """Explicit current Opus adaptation; no guessed entitlement or lesser model."""
+    if current_provider == "anthropic":
+        native = current_model
+    elif current_provider == "openrouter":
+        native = {"anthropic/claude-opus-5.5": "claude-opus-5-5"}.get(current_model)
+    else:
+        native = None
+    if not native or native not in verified_catalog:
+        raise ValueError("Current model lacks verified native OAuth adaptation")
+    return {"provider": "anthropic", "default": native, "api_mode": "anthropic_messages", "base_url": "https://api.anthropic.com"}
+
+
+def apply_config_override(config: dict) -> dict:
+    """In-memory routing overlay for a previously explicit operator override.
+
+    Workgroup, home, cwd, session, tools and storage never change. Automatic quota
+    mode does not adapt providers. Existing frozen sessions need a safe new launch.
+    """
+    import copy
+    from hermes_cli import auth
+    if profile_name_for_home(get_hermes_home()) != "professor":
+        return config
+    policy = auth._load_auth_store().get("oauth_account_fallback", {})
+    if not (policy.get("enabled") is True and policy.get("version") == 1 and policy.get("mode") == "user_override"
+            and policy.get("requested_owner") in {"studio", "personal"} and policy.get("authorization_reference") and policy.get("native_model")):
+        return config
+    model = policy["native_model"]
+    rows = auth._load_auth_store().get("credential_pool", {}).get("anthropic", [])
+    refs = [row for row in rows if row.get("source") == SOURCE and row.get("owner_profile") == policy.get("requested_owner") and model in row.get("verified_models", [])]
+    if not refs:
+        raise ValueError("Directed personal override has no verified owner reference")
+    # Selection/hydration independently verifies identity, expiry and removal.
+    result = copy.deepcopy(config)
+    result["model"] = {**(result.get("model") if isinstance(result.get("model"), dict) else {}), "provider": "anthropic", "default": model,
+                       "api_mode": "anthropic_messages", "base_url": "https://api.anthropic.com"}
+    # An old gateway credential must not win over selected OAuth authentication.
+    result["model"].pop("api_key", None)
+    result["model"].pop("api", None)
+    result["model"].pop("key_env", None)
+    result["fallback_model"] = []
+    result["fallback_providers"] = []
+    return result

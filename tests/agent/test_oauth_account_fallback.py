@@ -459,3 +459,64 @@ def test_verifier_reports_narrow_http_refusal_without_body(stores, monkeypatch):
         fallback.verify_pool_account("prof", persist=False)
     assert error.value.status == 401 and error.value.code == "endpoint_refused"
     assert "private" not in str(error.value)
+
+
+def test_greg_directed_personal_override_preserves_professor_even_without_quota(stores):
+    from types import SimpleNamespace
+    from agent.client_lifecycle import ClientLifecycleMixin
+    from hermes_cli.config import load_config_readonly
+    native = 'claude-opus-5-5'
+    fallback.add_reference(owner='personal', credential_id='personal', models=[native])
+    # Healthy primary remains primary in normal automatic mode.
+    assert cp.load_pool('anthropic').select(model=MODEL).id == 'prof'
+    fallback.configure(active=True, mode='user_override', authorization_reference='synthetic-direct-Greg-ruling', native_model=native)
+    configured = load_config_readonly()
+    assert configured['model']['provider'] == 'anthropic' and configured['model']['default'] == native
+    assert configured['model']['api_mode'] == 'anthropic_messages'
+    entry = cp.load_pool('anthropic').select(model=native)
+    assert entry.extra['owner_profile'] == 'personal'
+    agent = SimpleNamespace(provider='anthropic', model=native, base_url='https://api.anthropic.com', api_mode='anthropic_messages',
+        profile='professor', workgroup='professor', cwd='/Volumes/ACC-Private/synthetic', tools=['synthetic-vault-tool'], session_id='synthetic',
+        _anthropic_client=SimpleNamespace(close=lambda:None), _build_direct_anthropic_client=lambda *a:object(), _anthropic_oauth_flag=lambda t:True)
+    assert ClientLifecycleMixin._swap_credential(agent,entry)
+    assert agent.profile == agent.workgroup == 'professor' and agent.cwd == '/Volumes/ACC-Private/synthetic'
+    assert agent.tools == ['synthetic-vault-tool'] and agent.session_id == 'synthetic'
+    assert auth._auth_file_path() == stores[1]/'auth.json'
+
+
+def test_directed_override_invalid_owner_still_blocked(stores):
+    native = 'claude-opus-5-5'
+    fallback.add_reference(owner='personal', credential_id='personal', models=[native])
+    fallback.configure(active=True,mode='user_override',authorization_reference='synthetic-direct-Greg-ruling',native_model=native)
+    root, _, _ = stores
+    row = grant('personal');row['access_token']='invalid-replaced-token'
+    write(root/'auth.json',[row])
+    assert cp.load_pool('anthropic').select(model=native) is None
+
+
+def test_native_route_adaptation_requires_actual_catalog_and_direct_authorization(stores):
+    assert fallback.native_override_route(current_provider='openrouter',current_model='anthropic/claude-opus-5.5',verified_catalog=['claude-opus-5-5'])['api_mode']=='anthropic_messages'
+    with pytest.raises(ValueError,match='verified native'):
+        fallback.native_override_route(current_provider='openrouter',current_model='anthropic/claude-opus-5.5',verified_catalog=['claude-haiku-5-5'])
+    with pytest.raises(ValueError,match='direct authorization'):
+        fallback.configure(active=True,mode='user_override',native_model='claude-opus-5-5')
+
+
+def test_verified_studio_personal_grant_can_service_professor_without_refresh(stores, monkeypatch):
+    native = 'claude-opus-5-5'
+    fallback.add_reference(owner='studio', credential_id='studio', models=[native])
+    fallback.configure(active=True,mode='user_override',requested_owner='studio',
+        authorization_reference='synthetic-Greg-Studio-personal-for-Professor',native_model=native)
+    monkeypatch.setattr(ac,'refresh_anthropic_oauth_pure',lambda *a,**k:pytest.fail('healthy Studio grant must not refresh'))
+    before_owner=(stores[2]/'auth.json').read_bytes()
+    entry=cp.load_pool('anthropic').select(model=native)
+    assert entry.extra['owner_profile']=='studio' and entry.provider=='anthropic'
+    assert auth._auth_file_path()==stores[1]/'auth.json'
+    assert (stores[2]/'auth.json').read_bytes()==before_owner
+    assert entry.refresh_token is None
+    overlay=fallback.apply_config_override({'model':{'provider':'openrouter','default':'anthropic/claude-opus-5.5'},
+        'workgroup':'professor','cwd':'/Volumes/ACC-Private/synthetic','tools':['synthetic-vault-tool'], 'session_id':'synthetic'})
+    assert overlay['model']['default']==native and overlay['model']['api_mode']=='anthropic_messages'
+    assert overlay['workgroup']=='professor' and overlay['cwd']=='/Volumes/ACC-Private/synthetic'
+    assert overlay['tools']==['synthetic-vault-tool'] and overlay['session_id']=='synthetic'
+    assert overlay['fallback_providers']==[]
