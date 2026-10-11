@@ -433,3 +433,29 @@ def test_generation_merge_keeps_identity_binding_with_new_pair(stores):
     row = json.loads((professor / "auth.json").read_text())["credential_pool"]["anthropic"][0]
     assert row["access_token"] == rotated["access_token"]
     assert fallback.identity(row) == ("prof", "prof-org")
+
+
+def test_read_only_verifier_returns_private_proof_without_store_write(stores, monkeypatch):
+    import urllib.request
+    from io import BytesIO
+    _, professor, _ = stores
+    path = professor / "auth.json"
+    before = path.read_bytes()
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: BytesIO(json.dumps({
+        "account":{"uuid":"prof"}, "organization":{"uuid":"prof-org"}}).encode()))
+    proof = fallback.verify_pool_account("prof", persist=False)
+    assert proof == {"account_id":"prof", "organization_id":"prof-org", "source":"oauth_profile_response"}
+    assert path.read_bytes() == before
+    assert "binding" not in proof
+
+
+def test_verifier_reports_narrow_http_refusal_without_body(stores, monkeypatch):
+    import urllib.error
+    import urllib.request
+    from io import BytesIO
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: (_ for _ in ()).throw(
+        urllib.error.HTTPError("private-url", 401, "private-message", {}, BytesIO(b"private-body"))))
+    with pytest.raises(fallback.AccountVerificationError) as error:
+        fallback.verify_pool_account("prof", persist=False)
+    assert error.value.status == 401 and error.value.code == "endpoint_refused"
+    assert "private" not in str(error.value)

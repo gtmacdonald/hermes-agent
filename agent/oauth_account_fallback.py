@@ -270,7 +270,14 @@ def add_reference(*, owner: str, credential_id: str, models: list[str]):
     return load_pool("anthropic").add_entry(entry)
 
 
-def verify_pool_account(credential_id: str):
+class AccountVerificationError(ValueError):
+    """Redacted verifier failure; status/code only, never response bodies."""
+    def __init__(self, code: str, status: int | None = None):
+        self.code, self.status = code, status
+        super().__init__("OAuth account verification failed: " + code + (f" (HTTP {status})" if status else ""))
+
+
+def verify_pool_account(credential_id: str, *, persist: bool = True):
     """Explicit identity enrollment for an EXISTING pool-owned grant.
 
     One read-only authenticated provider profile request; never a model call,
@@ -279,6 +286,7 @@ def verify_pool_account(credential_id: str):
     """
     import json
     import urllib.request
+    import urllib.error
     from hermes_cli import auth
     path = auth._auth_file_path()
     with auth._auth_store_lock(target_path=path):
@@ -298,16 +306,24 @@ def verify_pool_account(credential_id: str):
             raise ValueError()
         ident = identity_from_exchange({**payload, "access_token": pair[0]})
         if ident is None:
-            raise ValueError()
+            raise AccountVerificationError("unsupported_identity_shape")
         ident["source"] = "oauth_profile_response"
+    except urllib.error.HTTPError as error:
+        raise AccountVerificationError("endpoint_refused", error.code) from None
+    except AccountVerificationError:
+        raise
     except Exception:
-        raise ValueError("OAuth account verification failed; existing login may need reauthentication") from None
+        raise AccountVerificationError("endpoint_unavailable_or_invalid_json") from None
     with auth._auth_store_lock(target_path=path):
         store = auth._load_auth_store(path)
         row = next((r for r in store.get("credential_pool", {}).get("anthropic", [])
                     if r.get("id") == credential_id), None)
         if row is None or (row.get("access_token"), row.get("refresh_token")) != pair:
             raise ValueError("OAuth grant changed during account verification; retry enrollment")
+        if not persist:
+            # Proof metadata remains private to the caller. No token-generation
+            # fingerprint or credential is returned and no enrollment is written.
+            return {key: ident[key] for key in ("account_id", "organization_id", "source")}
         row["oauth_account_identity"] = ident
         auth._save_auth_store(store, target_path=path)
     return True  # identity stays in the owner store, never emitted
