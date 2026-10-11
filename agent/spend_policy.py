@@ -11,6 +11,10 @@ HOSTS = {'ai-gateway.vercel.sh': 'vercel', 'openrouter.ai': 'openrouter', 'api.o
 class SpendDenied(ValueError):
     pass
 
+
+class _NamedDenial(SpendDenied):
+    """A denial whose cause is known; it passes the catch-all below unchanged (F-069)."""
+
 def require(value):
     if not value:
         raise SpendDenied("invalid model spend policy")
@@ -45,18 +49,32 @@ def prepare(url, body, *, policy_path=None):
     if not name:
         return body
     _fence_lane(name, url, body)
+    path = Path(policy_path or POLICY_PATH)
     try:
-        cfg = json.loads(Path(policy_path or POLICY_PATH).read_text())
+        try:
+            cfg = json.loads(path.read_text())
+        except (OSError, ValueError):
+            raise _NamedDenial(f'model spend policy denied: policy unreadable ({path.name})') from None
         require(cfg['version'] == 1 and cfg['enforcement'] == 'deny')
-        require(date.today() < date.fromisoformat(cfg['expires_on']))
+        expires = date.fromisoformat(cfg['expires_on'])
+        if not date.today() < expires:
+            # Named so a head can report expiry, not "unlisted": extending expires_on is Greg's call.
+            raise _NamedDenial(f'model spend policy denied: policy expired on {expires.isoformat()}')
         limits = cfg['limits']
         for key in ('max_output_tokens', 'max_body_bytes'):
             require(type(limits[key]) is int and limits[key] > 0)
-        spec = cfg['lanes'][name]['models'][body['model']]
-        require(isinstance(body, dict) and isinstance(spec, dict))
+        models = cfg['lanes'][name]['models']
+        require(isinstance(body, dict) and isinstance(models, dict))
+        if body.get('model') not in models:
+            raise _NamedDenial(f"model spend policy denied: {body.get('model')} is not listed on the {name} lane")
+        spec = models[body['model']]
+        require(isinstance(spec, dict))
         require(isinstance(spec['providers'], list) and bool(spec['providers']))
         require(all(isinstance(p, str) and p.strip() == p and bool(p) for p in spec['providers']))
-        require(date.today() < date.fromisoformat(spec['expires_on']))
+        spec_expires = date.fromisoformat(spec['expires_on'])
+        if not date.today() < spec_expires:
+            raise _NamedDenial(f"model spend policy denied: {body['model']} on the {name} lane expired on "
+                               f"{spec_expires.isoformat()}")
         ceiling = cfg['max_usd_per_million_tokens']
         require(isinstance(ceiling, (int, float)) and not isinstance(ceiling, bool))
         require(math.isfinite(ceiling) and ceiling >= 0)
@@ -75,6 +93,8 @@ def prepare(url, body, *, policy_path=None):
         require(spec['source'].startswith('https://') and spec['checked_on'])
         require(urlsplit(str(url)).path in spec['paths'])
         require(len(json.dumps(body).encode()) <= limits['max_body_bytes'])
+    except _NamedDenial:
+        raise
     except (OSError, KeyError, ValueError, TypeError, AssertionError, ArithmeticError, AttributeError):
         raise SpendDenied('model spend policy denied: missing, invalid, expired or unlisted route/model') from None
     # These fields can select extra models, paid server tools or alternate price classes.
