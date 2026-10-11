@@ -44,37 +44,57 @@ def _fence_lane(name, url, body):
         raise SpendDenied('Vercel permits only the three native decision backups')
 
 
+_GENERIC_ERRORS = (OSError, KeyError, ValueError, TypeError, AssertionError, ArithmeticError, AttributeError)
+_GENERIC_DENIAL = 'model spend policy denied: missing, invalid, expired or unlisted route/model'
+
+
+def _named_admission(path, name, body):
+    """(policy, model spec), or a denial that names its cause (F-069): a head must be able to tell an
+    unreadable file from an expired policy from an unlisted or expired model. Any other malformed
+    field gets the generic denial."""
+    try:
+        return _named_admission_checks(path, name, body)
+    except _NamedDenial:
+        raise
+    except _GENERIC_ERRORS:
+        raise SpendDenied(_GENERIC_DENIAL) from None
+
+
+def _named_admission_checks(path, name, body):
+    try:
+        cfg = json.loads(path.read_text())
+    except (OSError, ValueError):
+        raise _NamedDenial(f'model spend policy denied: policy unreadable ({path.name})') from None
+    require(cfg['version'] == 1 and cfg['enforcement'] == 'deny')
+    expires = date.fromisoformat(cfg['expires_on'])
+    if not date.today() < expires:
+        # Extending expires_on is Greg's call; the denial says so instead of "unlisted".
+        raise _NamedDenial(f'model spend policy denied: policy expired on {expires.isoformat()}')
+    models = cfg['lanes'][name]['models']
+    require(isinstance(body, dict) and isinstance(models, dict))
+    if body.get('model') not in models:
+        raise _NamedDenial(f"model spend policy denied: {body.get('model')} is not listed on the {name} lane")
+    spec = models[body['model']]
+    require(isinstance(spec, dict))
+    spec_expires = date.fromisoformat(spec['expires_on'])
+    if not date.today() < spec_expires:
+        raise _NamedDenial(f"model spend policy denied: {body['model']} on the {name} lane expired on "
+                           f"{spec_expires.isoformat()}")
+    return cfg, spec
+
+
 def prepare(url, body, *, policy_path=None):
     name = lane(url)
     if not name:
         return body
     _fence_lane(name, url, body)
-    path = Path(policy_path or POLICY_PATH)
+    cfg, spec = _named_admission(Path(policy_path or POLICY_PATH), name, body)
     try:
-        try:
-            cfg = json.loads(path.read_text())
-        except (OSError, ValueError):
-            raise _NamedDenial(f'model spend policy denied: policy unreadable ({path.name})') from None
-        require(cfg['version'] == 1 and cfg['enforcement'] == 'deny')
-        expires = date.fromisoformat(cfg['expires_on'])
-        if not date.today() < expires:
-            # Named so a head can report expiry, not "unlisted": extending expires_on is Greg's call.
-            raise _NamedDenial(f'model spend policy denied: policy expired on {expires.isoformat()}')
         limits = cfg['limits']
         for key in ('max_output_tokens', 'max_body_bytes'):
             require(type(limits[key]) is int and limits[key] > 0)
-        models = cfg['lanes'][name]['models']
-        require(isinstance(body, dict) and isinstance(models, dict))
-        if body.get('model') not in models:
-            raise _NamedDenial(f"model spend policy denied: {body.get('model')} is not listed on the {name} lane")
-        spec = models[body['model']]
-        require(isinstance(spec, dict))
         require(isinstance(spec['providers'], list) and bool(spec['providers']))
         require(all(isinstance(p, str) and p.strip() == p and bool(p) for p in spec['providers']))
-        spec_expires = date.fromisoformat(spec['expires_on'])
-        if not date.today() < spec_expires:
-            raise _NamedDenial(f"model spend policy denied: {body['model']} on the {name} lane expired on "
-                               f"{spec_expires.isoformat()}")
         ceiling = cfg['max_usd_per_million_tokens']
         require(isinstance(ceiling, (int, float)) and not isinstance(ceiling, bool))
         require(math.isfinite(ceiling) and ceiling >= 0)
@@ -93,10 +113,8 @@ def prepare(url, body, *, policy_path=None):
         require(spec['source'].startswith('https://') and spec['checked_on'])
         require(urlsplit(str(url)).path in spec['paths'])
         require(len(json.dumps(body).encode()) <= limits['max_body_bytes'])
-    except _NamedDenial:
-        raise
-    except (OSError, KeyError, ValueError, TypeError, AssertionError, ArithmeticError, AttributeError):
-        raise SpendDenied('model spend policy denied: missing, invalid, expired or unlisted route/model') from None
+    except _GENERIC_ERRORS:
+        raise SpendDenied(_GENERIC_DENIAL) from None
     # These fields can select extra models, paid server tools or alternate price classes.
     for field in ('models', 'plugins', 'web_search_options', 'search_parameters', 'modalities', 'audio', 'service_tier', 'routing', 'transforms'):
         if field in body:
