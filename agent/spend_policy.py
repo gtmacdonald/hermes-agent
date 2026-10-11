@@ -25,10 +25,26 @@ def lane(url):
         raise SpendDenied('metered route requires its exact HTTPS origin')
     return name
 
+VERCEL_DECISION_MODELS = ('typesafe-ai/jev', 'microsoft/microsoft-decision-1', 'liquid/d1')
+
+
+def _fence_lane(name, url, body):
+    """Greg 2026-10-10: Vercel is the native decision backup only.
+
+    Model/path fencing is independent of an older cached policy document.
+    """
+    if name != 'vercel':
+        return
+    if (not isinstance(body, dict) or body.get('model') not in VERCEL_DECISION_MODELS
+            or urlsplit(str(url)).path != '/v1/evaluate' or 'state' not in body or 'questions' not in body):
+        raise SpendDenied('Vercel permits only the three native decision backups')
+
+
 def prepare(url, body, *, policy_path=None):
     name = lane(url)
     if not name:
         return body
+    _fence_lane(name, url, body)
     try:
         cfg = json.loads(Path(policy_path or POLICY_PATH).read_text())
         require(cfg['version'] == 1 and cfg['enforcement'] == 'deny')
