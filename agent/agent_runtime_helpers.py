@@ -3720,6 +3720,12 @@ def extract_api_error_context(error: Exception) -> dict[str, Any]:
         elif isinstance(payload.get("resets_in_seconds"), (int, float)):
             # Codex/ChatGPT usage-limit bodies carry a relative window beside (or instead of) the epoch.
             context["reset_at"] = time.time() + float(payload["resets_in_seconds"])
+        # Account fallback uses only structured provider allowance codes and
+        # explicit window reset, never a guessed delay from message text.
+        from agent.oauth_account_fallback import QUOTA_REASONS
+        if context.get("reason") in QUOTA_REASONS and "reset_at" in context:
+            context["account_quota_reason"] = context["reason"]
+            context["account_quota_reset_at"] = context["reset_at"]
         _set_reset_from_retry_after(context, payload.get("retry_after"))
     headers = getattr(getattr(error, "response", None), "headers", None)
     if headers:

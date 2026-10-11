@@ -440,11 +440,17 @@ def _post_oauth_token(
 
 def _oauth_token_state(result: dict[str, Any], *, fallback_refresh_token: str = "") -> dict[str, Any]:
     """Token-endpoint JSON -> ``{access_token, refresh_token, expires_at_ms}`` (expires_in defaults to 3600s)."""
-    return {
+    state = {
         "access_token": result.get("access_token", ""),
         "refresh_token": result.get("refresh_token", fallback_refresh_token),
         "expires_at_ms": int(time.time() * 1000) + (result.get("expires_in", 3600) * 1000),
     }
+
+    from agent.oauth_account_fallback import identity_from_exchange
+    ident = identity_from_exchange(result)
+    if ident:
+        state["oauth_account_identity"] = ident
+    return state
 
 
 def refresh_anthropic_oauth_pure(refresh_token: str, *, use_json: bool = False) -> dict[str, Any]:
@@ -693,6 +699,16 @@ def resolve_anthropic_token(*, model: Optional[str] = None) -> Optional[str]:
 
     With *model*, a token the credential pool has benched for that model resolves to ``None``
     instead of being handed straight back to the caller that just saw it rate-limited."""
+    from agent.oauth_account_fallback import enabled
+    if enabled("anthropic"):
+        from agent.credential_pool import load_pool
+        pool = load_pool("anthropic")
+        if model:
+            entry = pool.select(model=model)
+            return entry.access_token if entry else None
+        # Diagnostics remain read-only and cannot use a borrowed account.
+        entries, _ = pool._available_entries(clear_expired=False, refresh=False)
+        return entries[0].access_token if entries else None
     _read_creds = functools.cache(read_claude_code_credentials)  # read the file at most once per resolve
     token = _first_env("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
     if token:

@@ -109,6 +109,14 @@ def sanitize_borrowed_credential_payload(
     result = dict(payload)
     if not is_borrowed_credential_source(result.get("source"), provider_id):
         return result
+    if result.get("source") == "profile_oauth_ref":
+        # Reference schema is an allowlist, including nested metadata: no raw
+        # provider bodies, token bindings or owner fingerprints reach Professor.
+        allowed = {"id", "label", "auth_type", "priority", "source", "owner_profile",
+                   "owner_credential_id", "owner_account_id", "owner_organization_id", "verified_models",
+                   "last_status", "last_status_at", "last_error_code", "last_error_reason",
+                   "last_error_reset_at", "status_cleared_at", "request_count", "expires_at_ms", "model_cooldowns"}
+        return {k: v for k, v in result.items() if k in allowed}
     fingerprint = _credential_secret_fingerprint(result)
     sanitized = {k: v for k, v in result.items() if not _is_secret_payload_key(k)}
     if fingerprint:
