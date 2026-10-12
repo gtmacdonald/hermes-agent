@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from agent.credential_pool_admin import CredentialPoolAdminMixin
+from agent.credential_pool_anthropic_refresh import CredentialPoolAnthropicRefreshMixin
 from agent.credential_pool_model_cooldowns import CredentialPoolModelCooldownMixin, model_cooldown_until
 
 import logging
@@ -1004,7 +1005,7 @@ class _RefreshDone(Exception):
         self.result = result
 
 
-class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin):
+class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin, CredentialPoolAnthropicRefreshMixin):
     def __init__(self, provider: str, entries: list[PooledCredential]):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
@@ -1529,6 +1530,16 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
     # ---- refresh -----------------------------------------------------------
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
+        if entry.source == "profile_oauth_ref":
+            from agent.oauth_account_fallback import enabled, hydrate
+            if not enabled(self.provider):
+                return None
+            try:
+                updated = hydrate(entry, force=force)
+            except (ValueError, OSError):
+                return None
+            self._replace_entry(entry, updated)
+            return updated
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
             if force:
                 self._mark_exhausted(entry, None)
@@ -1641,69 +1652,6 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         env_var = _REFRESH_TIMEOUT_ENV_VARS.get(self.provider, "HERMES_ANTHROPIC_REFRESH_TIMEOUT_SECONDS")
         refresh_timeout_seconds = auth_mod.env_float(env_var, 20)
         return max(float(auth_mod.AUTH_LOCK_TIMEOUT_SECONDS), float(refresh_timeout_seconds) + 5.0)
-
-    def _commit_anthropic_rotation(
-        self, entry: PooledCredential, refreshed: dict[str, Any]
-    ) -> None:
-        """Write a rotated Anthropic pair to its authoritative singleton, or fail closed.
-
-        claude_code -> ~/.claude/.credentials.json (so the fallback resolver
-        and other profiles see it). hermes_pkce -> ~/.hermes/.anthropic_oauth.json
-        (``_seed_from_singletons`` re-seeds it every load; a borrowed row commits
-        to the ROOT's file, never a new profile-local copy, #100339). Not
-        ``endswith``: manual:hermes_pkce is pool-owned and a singleton for it
-        would be a second authority for the same refresh-token family.
-        """
-        if entry.source == "claude_code":
-            store = "~/.claude/.credentials.json"
-        elif entry.source == "hermes_pkce":
-            store = "~/.hermes/.anthropic_oauth.json"
-        else:
-            return
-        try:
-            from agent import anthropic_credentials as ac
-            args = (refreshed["access_token"], refreshed["refresh_token"], refreshed["expires_at_ms"])
-            if entry.source == "claude_code":
-                ac._write_claude_code_credentials(*args, spent_refresh_token=entry.refresh_token or "")
-            else:
-                ac._write_hermes_oauth_credentials(*args, target=_singleton_target_for_entry(self, entry))
-        except Exception as wexc:
-            # Authoritative commit failed: do not mark, persist or return the
-            # rotation as successful, and bypass the re-POST recovery path —
-            # there is nothing left to retry with.
-            raise _RefreshDone(self._fail_closed_unpersisted_rotation(entry, wexc, store=store))
-
-    def _refresh_anthropic(self, entry: PooledCredential) -> PooledCredential:
-        """POST the Anthropic refresh, commit to the singleton, return the rotated (unpersisted) entry."""
-        from agent.anthropic_credentials import (
-            is_rotation_consumed_uncommitted,
-            refresh_anthropic_oauth_pure,
-            spent_rotation_source_path,
-        )
-
-        # Never POST a refresh token another process already spent: the
-        # durable sidecar verdict is what a fresh interpreter sees here.
-        source_path = spent_rotation_source_path(entry.source)
-        if is_rotation_consumed_uncommitted(entry.refresh_token, source_path=source_path) or (
-            is_rotation_consumed_uncommitted(entry.access_token, source_path=source_path)
-        ):
-            raise _RefreshDone(self._fail_closed_unpersisted_rotation(
-                entry,
-                RuntimeError(
-                    "credential pair was rotated by another process but the "
-                    "rotation never committed (spent-rotation sidecar verdict)"
-                ),
-                store=str(source_path or "credential store"),
-            ))
-        refreshed = refresh_anthropic_oauth_pure(entry.refresh_token, use_json=entry.source.endswith("hermes_pkce"))
-        updated = replace(
-            entry,
-            access_token=refreshed["access_token"],
-            refresh_token=refreshed["refresh_token"],
-            expires_at_ms=refreshed["expires_at_ms"],
-        )
-        self._commit_anthropic_rotation(entry, refreshed)
-        return updated
 
     def _post_tokens_refresh(self, entry: PooledCredential) -> PooledCredential:
         """Codex / xAI: POST the refresh and return the rotated (unpersisted) entry."""
@@ -2086,7 +2034,17 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
         available: list[PooledCredential] = []
         pending_refresh: list[PooledCredential] = []
         sole_credential = self._is_sole_credential()
-        for entry in self._entries:
+        from agent.oauth_account_fallback import enabled, candidates, hydrate, SOURCE
+        account_fallback_enabled = enabled(self.provider)
+        eligible = candidates(self._entries, model) if account_fallback_enabled else [
+            e for e in self._entries if e.source != SOURCE]
+        for entry in eligible:
+            if entry.source == SOURCE:
+                try:
+                    entry = hydrate(entry, model=model)
+                    self._replace_entry(self._find(lambda e: e.id == entry.id), entry)
+                except (ValueError, OSError):
+                    continue
             # Borrowed credentials persist as metadata-only references and are
             # hydrated from their live source on load; never lease an
             # unhydrated duplicate as an empty key.
@@ -2315,7 +2273,9 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             if entry is None:
                 return None
             _label = entry.label or entry.id[:8]
-            if self._is_model_scoped_failure(status_code, model, failure_reason):
+            from agent.oauth_account_fallback import enabled, observe
+            account_quota = enabled(self.provider) and observe(self, entry, status_code, error_context)
+            if not account_quota and self._is_model_scoped_failure(status_code, model, failure_reason):
                 # A generic Anthropic 429 (per-model rate limit) or a Codex account model
                 # entitlement rejection: bench this model only, the credential stays
                 # available for its siblings.
@@ -2324,7 +2284,8 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
                 self._current_id = None
                 next_entry, _pending = self._select_unlocked(refresh=False, model=model)
                 return next_entry
-            self._mark_exhausted(entry, status_code, error_context, failure_reason=failure_reason)
+            if not account_quota:
+                self._mark_exhausted(entry, status_code, error_context, failure_reason=failure_reason)
             # A 402/429/401 is a key-level failure, and the same key can back
             # several entries (an explicit entry plus a ``model_config`` row
             # auto-seeded from ``model.api_key``). Marking only the first
@@ -2332,7 +2293,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             # the depleted key, and rotation never converges (~2.5 min hang).
             # Mark every entry sharing the failed key.
             failed_runtime_key = entry.runtime_api_key
-            if identity_supplied and failed_runtime_key:
+            if identity_supplied and failed_runtime_key and not account_quota:
                 siblings = [
                     s for s in self._entries if s.id != entry.id and s.runtime_api_key == failed_runtime_key
                 ]
@@ -2353,7 +2314,7 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             else:
                 logger.info("credential pool: marking %s exhausted (status=%s), rotating", _label, status_code)
             self._current_id = None
-            next_entry, _pending = self._select_unlocked(refresh=False)
+            next_entry, _pending = self._select_unlocked(refresh=False, model=model)
             if next_entry is not None and next_entry.id == entry.id:
                 # No-recovery guard (#97315): selection handed back the very entry that was
                 # just marked (the auth-store sync adopted fresher tokens, or a quota probe
@@ -2998,6 +2959,9 @@ def _prune_stale_seeded_entries(
         # A process that merely lacks the env var must NOT delete the on-disk
         # entry for every other process (#9331); prune only when explicitly
         # requested (an `hermes auth` command that confirmed the source is gone).
+        if entry.source == "profile_oauth_ref":
+            # Explicit references are never seeded; auth remove must stay removed.
+            return False
         if entry.source.startswith("env:"):
             return prune_env_sources
         # File-backed singletons and Hermes PKCE disappear when their backing file is gone.
