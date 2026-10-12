@@ -1011,17 +1011,6 @@ _FB_SINGLE_REQUIRED_FIELDS = (
     ("model", "Add: model: anthropic/claude-sonnet-4 (or another model)"))
 
 
-def _validate_voice(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
-    voice_cfg = config.get("voice")
-    if not (isinstance(voice_cfg, dict) and "submit_mode" in voice_cfg):
-        return
-    submit_mode = voice_cfg.get("submit_mode")
-    normalized = submit_mode.strip().lower() if isinstance(submit_mode, str) else None
-    if normalized not in {"direct", "draft"}:
-        _issue(issues, "error", f"voice.submit_mode must be 'direct' or 'draft', got {submit_mode!r}",
-               "Set voice.submit_mode to direct (submit immediately) or draft (edit before sending)")
-
-
 def _validate_timezone(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
     """``timezone`` must be an IANA name the runtime can load.
 
@@ -1184,8 +1173,9 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
             from hermes_cli.config_home import config_load_issue
             return [config_load_issue(exc)]
 
+    from hermes_cli.config_validate_voice import validate_voice
     issues: list[ConfigIssue] = []
-    _validate_voice(config, issues)
+    validate_voice(config, issues)
     _validate_timezone(config, issues)
     cp = config.get("custom_providers")
     fb = config.get("fallback_model")
@@ -2074,7 +2064,8 @@ def load_config() -> dict[str, Any]:
     Cached on the file signature; returns a deepcopy since most call sites mutate the result.
     Read-only hot paths should use ``load_config_readonly()`` to skip the deepcopy."""
     from hermes_cli.kanban_worker_bootstrap import local_worker_overlay
-    return local_worker_overlay(_load_config_impl(want_deepcopy=True))
+    from agent.oauth_account_fallback import apply_config_override
+    return local_worker_overlay(apply_config_override(_load_config_impl(want_deepcopy=True)))
 
 
 def load_config_readonly() -> dict[str, Any]:
@@ -2082,7 +2073,8 @@ def load_config_readonly() -> dict[str, Any]:
     **Mutating the returned dict (or any nested structure) corrupts the in-process cache for
     every subsequent caller** — only for code paths that never write to the result."""
     from hermes_cli.kanban_worker_bootstrap import local_worker_overlay
-    return local_worker_overlay(_load_config_impl(want_deepcopy=False))
+    from agent.oauth_account_fallback import apply_config_override
+    return local_worker_overlay(apply_config_override(_load_config_impl(want_deepcopy=False)))
 
 
 def _ensure_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:
