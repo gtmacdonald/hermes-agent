@@ -1895,6 +1895,7 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    metadata = carry_reviewed_policy(conn, run_id, metadata)
     conn.execute(
         """
         UPDATE task_runs
@@ -2606,32 +2607,6 @@ def _scan_prose_for_phantom_ids(conn: sqlite3.Connection, text: str) -> list[str
     return _missing_task_ids(conn, dict.fromkeys(_TASK_ID_PROSE_RE.findall(text)))
 
 
-class HallucinatedCardsError(ValueError):
-    """``complete_task`` refused: ``created_cards`` has ids that don't exist or
-    weren't created by this worker (``.phantom``). A ``ValueError`` so tool
-    error handlers treat it as recoverable."""
-
-    def __init__(self, phantom: list[str], completing_task_id: str):
-        self.phantom = list(phantom)
-        self.completing_task_id = completing_task_id
-        super().__init__(
-            f"completion blocked: claimed created_cards that do not exist "
-            f"or were not created by this worker: {', '.join(phantom)}"
-        )
-
-
-class EmptyCompletionError(ValueError):
-    """``complete_task`` refused: no substantive ``result``, ``summary``, or
-    stored result. A ``ValueError`` so tool error handlers treat it as
-    recoverable. Review approvals are exempt (the human is the record)."""
-
-    def __init__(self, task_id: str):
-        self.task_id = task_id
-        super().__init__(
-            f"completion blocked: {task_id} has no result or summary evidence"
-        )
-
-
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -2662,6 +2637,7 @@ def complete_task(
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
+    gate_inspection_completion(conn, task_id)
     if not _parents_satisfied(conn, task_id):
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
@@ -2677,6 +2653,7 @@ def complete_task(
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
+        gate_inspection_completion(conn, task_id)
         if not _parents_satisfied(conn, task_id):
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
@@ -4407,6 +4384,13 @@ from hermes_cli.kanban_db_workspace import (
     _scratch_workspace,
 )
 from hermes_cli.kanban_db_block import _route_block
+from hermes_cli.kanban_db_completion import (
+    EmptyCompletionError,
+    HallucinatedCardsError,
+    InspectionOnlyCompletionError,
+    carry_reviewed_policy,
+    gate_inspection_completion,
+)
 from hermes_cli.kanban_db_claims import (
     LiveClaimError,
     _claim_is_live,

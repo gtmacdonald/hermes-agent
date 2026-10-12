@@ -292,6 +292,11 @@ def load_cli_config() -> dict[str, Any]:
 
     defaults = managed_scope.apply_managed_overlay(defaults)
 
+    # The CLI has its own config loader: owned local workers need the same
+    # ephemeral route/memory/tool restrictions as the shared config loader.
+    from hermes_cli.kanban_worker_bootstrap import local_worker_overlay
+    defaults = local_worker_overlay(defaults)
+
     _mirror_config_to_env(defaults, _file_has_terminal_config)
 
     return defaults
