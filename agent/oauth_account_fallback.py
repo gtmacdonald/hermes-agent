@@ -205,20 +205,40 @@ def hydrate(entry, *, force: bool = False, model: str | None = None):
             old_access, old_refresh = row["access_token"], row["refresh_token"]
             try:
                 rotated = ac.refresh_anthropic_oauth_pure(old_refresh, use_json=str(row["source"]).endswith("hermes_pkce"))
-            except Exception:
+            except Exception:  # health: allow BLE001 -- _post_oauth_token re-raises any transport error; all become one redacted ValueError, no token-bearing traceback
                 raise ValueError("OAuth owner refresh failed; reauthentication may be required") from None
             ident = dict(row["oauth_account_identity"])
             ident["binding"] = _binding(rotated["access_token"])
             row.update(rotated, oauth_account_identity=ident)
             try:
                 auth._save_auth_store(store, target_path=path)
-            except Exception:
+            except Exception:  # health: allow BLE001 -- the pair is already spent: any commit failure must quarantine it, never escape unquarantined
                 # The single-use pair was spent: quarantine on the durable existing
                 # sidecar, never expose the uncommitted pair or replay the old one.
                 ac.mark_rotation_consumed_uncommitted(old_refresh, old_access, source_path=path)
                 raise ValueError("OAuth owner commit failed; reauthentication required") from None
         return replace(entry, access_token=row["access_token"], refresh_token=None,
                        expires_at_ms=row.get("expires_at_ms"), extra={**entry.extra, "selected_model": model})
+
+
+def tag_account_quota(context: dict) -> None:
+    """Mark a provider-body allowance error for account fallback.
+
+    Only structured provider allowance codes with an explicit window reset qualify,
+    never a delay guessed from message text or a later Retry-After header.
+    """
+    if context.get("reason") in QUOTA_REASONS and "reset_at" in context:
+        context["account_quota_reason"] = context["reason"]
+        context["account_quota_reset_at"] = context["reset_at"]
+
+
+def rebind_identity(entry, updated):
+    """Carry an enrolled identity across a pool-owned refresh, bound to the new access token."""
+    if identity(entry.to_dict()) is None:
+        return updated
+    ident = dict(entry.extra["oauth_account_identity"])
+    ident["binding"] = _binding(updated.access_token)
+    return replace(updated, extra={**updated.extra, "oauth_account_identity": ident})
 
 
 def observe(pool, entry, status_code, context):
@@ -302,6 +322,7 @@ def verify_pool_account(credential_id: str, *, persist: bool = True):
     login, token refresh, credential copy or profile switch. Errors contain no
     tokens, provider bodies, identity values or token fingerprints.
     """
+    import http.client
     import json
     import urllib.request
     import urllib.error
@@ -330,7 +351,7 @@ def verify_pool_account(credential_id: str, *, persist: bool = True):
         raise AccountVerificationError("endpoint_refused", error.code) from None
     except AccountVerificationError:
         raise
-    except Exception:
+    except (OSError, ValueError, TypeError, KeyError, http.client.HTTPException):
         raise AccountVerificationError("endpoint_unavailable_or_invalid_json") from None
     with auth._auth_store_lock(target_path=path):
         store = auth._load_auth_store(path)

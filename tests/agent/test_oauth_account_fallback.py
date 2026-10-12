@@ -2,6 +2,7 @@
 import json
 import os
 from collections import OrderedDict
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -132,14 +133,19 @@ def test_owner_refresh_is_once_across_consumers_and_commit_before_use(stores, mo
     store = json.loads(path.read_text())
     store["credential_pool"]["anthropic"][0]["expires_at_ms"] = 1
     path.write_text(json.dumps(store))
-    calls = []
+    calls, started, release = [], threading.Event(), threading.Event()
     def refresh(token, **kwargs):
         calls.append(token)
-        time.sleep(.05)
+        started.set()
+        release.wait(timeout=5)  # hold the owner lock while the second consumer arrives
         return {"access_token": "sk-ant-oat01-rotated", "refresh_token": "rotated-refresh", "expires_at_ms": int((time.time()+7200)*1000)}
     monkeypatch.setattr(ac, "refresh_anthropic_oauth_pure", refresh)
     with ThreadPoolExecutor(max_workers=2) as workers:
-        results = list(workers.map(lambda _: fallback.hydrate(ref), range(2)))
+        first = workers.submit(fallback.hydrate, ref)
+        assert started.wait(timeout=5)
+        second = workers.submit(fallback.hydrate, ref)
+        release.set()
+        results = [first.result(), second.result()]
     assert len(calls) == 1
     assert all(r.access_token == "sk-ant-oat01-rotated" and r.refresh_token is None for r in results)
     owner = json.loads(path.read_text())["credential_pool"]["anthropic"][0]
