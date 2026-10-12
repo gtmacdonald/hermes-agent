@@ -59,6 +59,25 @@ def test_missing_expired_or_non_enforcing_policy_denies(tmp_path):
         sp.prepare(OPENROUTER, _body(), policy_path=_policy(tmp_path, enforcement="warn"))
 
 
+def test_denial_names_its_cause(tmp_path):
+    """F-069: a head must tell expiry from an unlisted model from an unreadable file."""
+    with pytest.raises(sp.SpendDenied, match=r"policy unreadable"):
+        sp.prepare(OPENROUTER, _body(), policy_path=tmp_path / "missing.json")
+    today = date.today().isoformat()
+    with pytest.raises(sp.SpendDenied, match=rf"policy expired on {today}"):
+        sp.prepare(OPENROUTER, _body(), policy_path=_policy(tmp_path, expires=today))
+    with pytest.raises(sp.SpendDenied, match=r"anthropic/claude-opus-5\.5 is not listed on the openrouter lane"):
+        sp.prepare(OPENROUTER, dict(_body(), model="anthropic/claude-opus-5.5"), policy_path=_policy(tmp_path))
+    path = _policy(tmp_path)
+    cfg = json.loads(path.read_text())
+    cfg["lanes"]["openrouter"]["models"][MODEL]["expires_on"] = today
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(sp.SpendDenied, match=rf"{MODEL} on the openrouter lane expired on {today}"):
+        sp.prepare(OPENROUTER, _body(), policy_path=path)
+    with pytest.raises(sp.SpendDenied, match=r"^model spend policy denied: "):
+        sp.prepare(OPENROUTER, _body(), policy_path=_policy(tmp_path, enforcement="warn"))
+
+
 def test_unlisted_model_denied(tmp_path):
     with pytest.raises(sp.SpendDenied):
         sp.prepare(OPENROUTER, dict(_body(), model="anthropic/claude-opus-5.5"), policy_path=_policy(tmp_path))
