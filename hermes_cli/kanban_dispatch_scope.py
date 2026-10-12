@@ -20,6 +20,24 @@ def task_digest(row):
                                     sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def worker_policy(entry):
+    """Optional finite native limits/phase on the reviewed admission itself."""
+    policy = entry.get("worker_policy")
+    if policy is None:
+        return {}
+    if not isinstance(policy, dict):
+        raise ValueError("worker_policy must be an object")
+    turns, budget = policy.get("max_turns"), policy.get("run_budget_seconds")
+    phase = policy.get("completion_mode")
+    if type(turns) is not int or not 1 <= turns <= 80:
+        raise ValueError("reviewed max_turns must be an integer in 1..80")
+    if type(budget) is not int or not 1 <= budget <= 600:
+        raise ValueError("reviewed run_budget_seconds must be an integer in 1..600")
+    if phase not in {"inspection", "full"}:
+        raise ValueError("reviewed completion_mode must be inspection or full")
+    return dict(max_turns=turns, run_budget_seconds=budget, completion_mode=phase)
+
+
 def reviewed_entries(scope, board):
     """Malformed/missing/expired scope fails closed. No implicit profile fallback."""
     if board in HARNESS_BOARDS or not isinstance(scope, list):
@@ -35,6 +53,13 @@ def reviewed_entries(scope, board):
             continue
         if not all(isinstance(entry.get(k), str) and entry[k].strip()
                    for k in ("task_id", "task_sha256", "judge_sha256")):
+            continue
+        baseline = entry.get("reviewed_through_run_id", 0)
+        if type(baseline) is not int or baseline < 0:
+            continue
+        try:
+            worker_policy(entry)
+        except ValueError:
             continue
         entries.append(entry)
     return entries
@@ -63,8 +88,11 @@ def eligible(conn, entry):
         if model != local["model"] or provider != local["provider"] or not ReadyCycle(kb)._route_matches(row, local):
             return False
     # A finite approval is consumed by its first attempt; no automatic retries.
-    if conn.execute("SELECT 1 FROM task_runs WHERE task_id=? LIMIT 1",
-                    (entry["task_id"],)).fetchone():
+    latest = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_runs WHERE task_id=?",
+                          (entry["task_id"],)).fetchone()[0]
+    # A fresh owner review names the EXACT latest run, never a future watermark.
+    # The next real run changes this value, consuming this admission once.
+    if latest != entry.get("reviewed_through_run_id", 0):
         return False
     if conn.execute("SELECT 1 FROM task_links l LEFT JOIN tasks p ON p.id=l.parent_id "
                     "WHERE l.child_id=? AND (p.id IS NULL OR p.status NOT IN ('done','archived')) LIMIT 1",

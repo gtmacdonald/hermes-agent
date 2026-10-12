@@ -43,6 +43,30 @@ def test_overlay_is_a_no_op_outside_local_workers(monkeypatch):
     assert wb.local_worker_overlay(config) is config
 
 
+def test_classic_cli_loader_applies_local_policy_and_explicit_native_limits(local_worker, monkeypatch, tmp_path):
+    import sys
+    from hermes_cli import cli_config_load as loader
+    from hermes_cli.cli_init_mixin import CLIInitMixin
+    mirrored = []
+    facade = SimpleNamespace(
+        _hermes_home=tmp_path, _cli_config_defaults=loader._cli_config_defaults,
+        _merge_file_config=loader._merge_file_config,
+        _mirror_config_to_env=lambda config, terminal: mirrored.append(config),
+    )
+    monkeypatch.setitem(sys.modules, "cli", facade)
+    from hermes_cli import managed_scope
+    monkeypatch.setattr(managed_scope, "apply_managed_overlay", lambda config: config)
+    config = loader.load_cli_config()
+    assert config["agent"]["max_turns"] <= 80
+    assert config["fallback_model"] == [] and config["mcp_servers"] == {}
+    assert config["auxiliary"]["provider"] == "lan"
+    assert mirrored[0] is config
+    facade.CLI_CONFIG = config
+    instance = CLIInitMixin()
+    instance._init_turn_limits(8, 480)
+    assert instance.max_turns == 8 and instance.run_budget_seconds == 480
+
+
 def test_overlay_pins_everything_to_the_lan_route_without_mutating_input(local_worker):
     config = {"auxiliary": {"provider": "openrouter", "vision": {"provider": "openrouter", "model": "v"}},
               "fallback_model": [{"provider": "x"}], "mcp_servers": {"s": {}},

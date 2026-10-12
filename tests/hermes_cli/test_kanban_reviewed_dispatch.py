@@ -40,6 +40,60 @@ def test_reviewed_entries_fail_closed():
     assert reviewed_entries([_entry(board="claude")], "claude") == []
 
 
+@pytest.mark.parametrize("change", [
+    {"reviewed_through_run_id": True}, {"reviewed_through_run_id": -1},
+    {"worker_policy": {"max_turns": 0}},
+    {"worker_policy": {"max_turns": 8, "run_budget_seconds": 601, "completion_mode": "inspection"}},
+])
+def test_invalid_continuation_policy_cannot_admit_work(change):
+    assert reviewed_entries([_entry(**change)], "reviewed") == []
+
+
+def test_native_inspection_spawn_is_bounded_and_cannot_accept_implementation(board, monkeypatch):
+    import json
+    from hermes_cli import kanban_db_dispatch as kbd
+    from hermes_cli._parser import build_top_level_parser
+    monkeypatch.setattr(kbd, "_profile_exists_fn", lambda: lambda profile: True)
+    monkeypatch.setattr(kb, "_fire_worker_spawned_hook", lambda *a, **k: None)
+    with kbc.connect_closing(board=board) as conn:
+        task_id, entry = _approved_card(conn)
+        entry["worker_policy"] = dict(max_turns=8, run_budget_seconds=480, completion_mode="inspection")
+        commands = []
+        def spawn(task, workspace, board):
+            commands.append(kbd._worker_argv(task, "studio", None, query_file="/tmp/spec"))
+        result = kbd.dispatch_once(conn, board=board, eligibility_scope=[entry], spawn_fn=spawn)
+        assert len(result.spawned) == 1
+        argv = commands[0]
+        args = build_top_level_parser()[2].parse_args(argv[argv.index("chat") + 1:])
+        assert args.max_turns == 8 and args.run_budget == 480
+        run_id = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+        for force in (False, True):
+            with pytest.raises(kb.InspectionOnlyCompletionError):
+                kb.complete_task(conn, task_id, expected_run_id=run_id, force=force)
+        assert kb.request_review(conn, task_id, expected_run_id=run_id,
+                                 summary="Inspection report; implementation remains",
+                                 metadata={"reviewed_worker_policy": {"completion_mode": "full"}})
+        policy = json.loads(conn.execute("SELECT metadata FROM task_runs WHERE id=?", (run_id,)).fetchone()[0])
+        assert policy["reviewed_worker_policy"]["completion_mode"] == "inspection"
+        with pytest.raises(kb.InspectionOnlyCompletionError):
+            kb.complete_task(conn, task_id, force=True)
+        # A newly reviewed full attempt retains history and consumes exactly one grant.
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        assert not eligible(conn, entry)
+        assert not eligible(conn, dict(entry, reviewed_through_run_id=run_id + 1))
+        fresh = dict(entry, reviewed_through_run_id=run_id,
+                     task_sha256=task_digest(conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()),
+                     worker_policy=dict(max_turns=8, run_budget_seconds=480, completion_mode="full"))
+        assert eligible(conn, fresh)
+        assert len(kbd.dispatch_once(conn, board=board, eligibility_scope=[fresh], spawn_fn=spawn).spawned) == 1
+        second = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()[0]
+        assert second > run_id
+        assert kb.complete_task(conn, task_id, expected_run_id=second, result="Verified full implementation")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (task_id,))
+        assert not eligible(conn, fresh)
+        assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)).fetchone()[0] == 2
+
+
 def _approved_card(conn, **overrides):
     fields = dict(title="Reviewed work", body="Exact spec", assignee="studio",
                   model_override="gpt-5.6-sol", provider_override="openai-codex")

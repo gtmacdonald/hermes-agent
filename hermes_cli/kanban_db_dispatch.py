@@ -2024,10 +2024,10 @@ def _dispatch_reviewed_once(conn, scope, *, board, spawn_fn, dry_run, max_spawn,
 
     Running workers keep their normal lifecycle: crash, stale, orphan and max-runtime
     sweeps run every tick, as upstream (without promotion). Failed attempts
-    require a new reviewed approval; eligibility refuses any card that already ran, so
-    a reclaim back to ready is never an automatic retry.
+    require a new reviewed approval naming the exact latest run; reclaiming a
+    card back to ready never renews its consumed admission automatically.
     """
-    from hermes_cli.kanban_dispatch_scope import reviewed_entries, eligible, other_running_readonly
+    from hermes_cli.kanban_dispatch_scope import reviewed_entries, eligible, other_running_readonly, worker_policy
     result = DispatchResult()
     _run_reclaim_phase(conn, result, stale_timeout_seconds=stale_timeout_seconds,
                        failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
@@ -2058,7 +2058,8 @@ def _dispatch_reviewed_once(conn, scope, *, board, spawn_fn, dry_run, max_spawn,
                                dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
                                failure_limit=failure_limit, spawn_fn=spawn_fn,
                                per_profile_cap=per_profile_cap, per_profile_running=running,
-                               eligibility_guard=lambda c, e=entry: eligible(c, e)):
+                               eligibility_guard=lambda c, e=entry: eligible(c, e),
+                               reviewed_policy=worker_policy(entry)):
             used += 1
     return result
 
@@ -2091,6 +2092,7 @@ def _dispatch_lane_task(
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
     eligibility_guard=None,
+    reviewed_policy=None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2179,6 +2181,22 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
+        if reviewed_policy:
+            claimed._reviewed_worker_policy = dict(reviewed_policy)
+            with _kb.write_txn(conn):
+                current = conn.execute("SELECT current_run_id, status FROM tasks WHERE id=?",
+                                       (claimed.id,)).fetchone()
+                if current is None or current["status"] != "running" or current["current_run_id"] != claimed.current_run_id:
+                    raise RuntimeError("reviewed worker claim changed before policy persistence")
+                import json
+                prior = conn.execute("SELECT metadata FROM task_runs WHERE id=?",
+                                     (claimed.current_run_id,)).fetchone()
+                metadata = json.loads(prior["metadata"] or "{}")
+                metadata["reviewed_worker_policy"] = dict(reviewed_policy)
+                conn.execute("UPDATE task_runs SET metadata=? WHERE id=?",
+                             (json.dumps(metadata), claimed.current_run_id))
+                _kb._append_event(conn, claimed.id, "reviewed_worker_policy", reviewed_policy,
+                                  run_id=claimed.current_run_id)
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
@@ -2835,6 +2853,10 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str], *, qu
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend(["chat", "--query-file", query_file])
+    policy = getattr(task, "_reviewed_worker_policy", {})
+    if policy:
+        cmd.extend(["--max-turns", str(policy["max_turns"]),
+                    "--run-budget", str(policy["run_budget_seconds"])])
     # query-file feeds the same one-shot path: cli.py runs the judge loop too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd

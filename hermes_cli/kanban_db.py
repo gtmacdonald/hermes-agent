@@ -1895,6 +1895,11 @@ def _end_run(
     run_id = _current_run_id(conn, task_id)
     if run_id is None:
         return None
+    stored = conn.execute("SELECT metadata FROM task_runs WHERE id=?", (run_id,)).fetchone()
+    prior = json.loads(stored["metadata"] or "{}") if stored else {}
+    if "reviewed_worker_policy" in prior:
+        metadata = dict(metadata or {})
+        metadata["reviewed_worker_policy"] = prior["reviewed_worker_policy"]
     conn.execute(
         """
         UPDATE task_runs
@@ -2636,6 +2641,21 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+class InspectionOnlyCompletionError(ValueError):
+    """A real inspection artifact is not full canonical implementation acceptance."""
+
+
+def _gate_inspection_completion(conn, task_id):
+    row = conn.execute("SELECT metadata FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                       (task_id,)).fetchone()
+    metadata = json.loads(row["metadata"] or "{}") if row else {}
+    policy = metadata.get("reviewed_worker_policy", {})
+    if isinstance(policy, dict) and policy.get("completion_mode") == "inspection":
+        raise InspectionOnlyCompletionError(
+            "Inspection-only run cannot complete the canonical implementation. "
+            "Use kanban_request_review or kanban_block with the report and remaining work.")
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -2662,6 +2682,7 @@ def complete_task(
     """
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
+    _gate_inspection_completion(conn, task_id)
     if not _parents_satisfied(conn, task_id):
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
@@ -2677,6 +2698,7 @@ def complete_task(
     with write_txn(conn):
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
+        _gate_inspection_completion(conn, task_id)
         if not _parents_satisfied(conn, task_id):
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
