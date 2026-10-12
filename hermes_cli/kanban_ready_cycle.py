@@ -11,7 +11,8 @@ import subprocess
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
-from hermes_cli.kanban_dispatch_scope import FIELDS, HARNESS_BOARDS, task_digest, reviewed_entries
+from hermes_cli.kanban_dispatch_scope import (FIELDS, HARNESS_BOARDS, SCOPED_ASSIGNEES, task_digest,
+                                              reviewed_entries)
 
 
 def spec_digest(row):
@@ -54,7 +55,7 @@ def candidate(conn, entry):
     row = conn.execute("SELECT * FROM tasks WHERE id=?", (entry["task_id"],)).fetchone()
     if row is None or row["status"] != "ready" or row["claim_lock"] is not None:
         return None
-    if row["assignee"] not in {"professor", "studio"} or spec_digest(row) != entry["spec_sha256"]:
+    if row["assignee"] not in SCOPED_ASSIGNEES or spec_digest(row) != entry["spec_sha256"]:
         return None
     if conn.execute("SELECT 1 FROM task_runs WHERE task_id=? LIMIT 1", (entry["task_id"],)).fetchone():
         return None
@@ -76,6 +77,10 @@ class ReadyCycle:
         key = hashlib.sha256((e["board"] + "\0" + e["task_id"] + "\0" + e["spec_sha256"]).encode()).hexdigest()
         return self.root / (key + ".json")
 
+    def pending(self, e):
+        """No receipt yet: the next cycle may still select this approval."""
+        return not self._path(e).exists()
+
     def _read(self, path):
         try:
             return json.loads(path.read_text())
@@ -90,9 +95,9 @@ class ReadyCycle:
 
     def _route_matches(self, row, e):
         # Verify the profile route still has the reviewed LAN endpoint, before assigning.
-        import hermes_yaml as yaml
+        from hermes_cli.config import read_user_config_raw
         try:
-            cfg = yaml.safe_load((Path(self.kb.kanban_home()) / "profiles" / row["assignee"] / "config.yaml").read_text())
+            cfg = read_user_config_raw(Path(self.kb.kanban_home()) / "profiles" / row["assignee"] / "config.yaml")
             route = cfg.get("providers", {}).get(e["provider"], {})
             return route.get("base_url", "").rstrip("/") == e["endpoint"].rstrip("/") and (
                 e["model"] in route.get("models", {}) or e["model"] == route.get("model"))
@@ -131,7 +136,7 @@ class ReadyCycle:
             if count >= budget:
                 break
             path = self._path(e)
-            if path.exists():
+            if not self.pending(e):
                 continue  # selected, failed, interrupted all require a fresh human review
             conn = kbc.connect(board=e["board"])
             try:
@@ -150,7 +155,7 @@ class ReadyCycle:
                     # Manual override never invokes scrub, gateway_key or either hosted judge.
                     r = self.run([str(Path.home()/".local/bin/card-model"), e["task_id"], "--board", e["board"],
                                   "--profile", row["assignee"], "--model", e["model"], "--provider", e["provider"],
-                                  "--apply", "--json"], capture_output=True, text=True, timeout=120)
+                                  "--apply", "--json"], capture_output=True, text=True, encoding="utf-8", timeout=120)
                     receipt["exit_code"] = r.returncode
                     row = candidate(conn, e)
                     if r.returncode != 0 or row is None or row["model_override"] != e["model"] or row["provider_override"] != e["provider"]:

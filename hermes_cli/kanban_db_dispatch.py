@@ -154,7 +154,7 @@ class DispatchResult:
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
 
 
-def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
+def describe_suppression(results: Iterable[Optional[DispatchResult]]) -> str:
     """One line naming why the tick(s) held ready work back, or ``""``.
 
     ``active_pr=1, recent_success=2, rate_limited=1, skipped_locked=1,
@@ -193,12 +193,12 @@ def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
 # leaves in its own log (``KANBAN_WORKER_EXIT_TRAILER``).
 _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
-_recent_worker_exits: "dict[int, tuple[int, float]]" = {}
+_recent_worker_exits: dict[int, tuple[int, float]] = {}
 
 # Windows has no ``waitpid(-1)``: a child's exit code is only recoverable
 # through a live handle, so ``_default_spawn`` parks each worker's ``Popen``
 # here (Windows only) and ``reap_worker_zombies`` polls it. Entry: ``pid -> Popen``.
-_live_worker_procs: "dict[int, subprocess.Popen]" = {}
+_live_worker_procs: dict[int, subprocess.Popen] = {}
 
 
 def _wait_status_from_returncode(returncode: int) -> int:
@@ -223,7 +223,7 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
             _recent_worker_exits.pop(_pid, None)
 
 
-def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
+def _classify_worker_exit(pid: int) -> tuple[str, Optional[int]]:
     """``(kind, code)`` for a reaped worker PID: ``clean_exit`` (rc 0 while
     still ``running`` = protocol violation), ``rate_limited``
     (``KANBAN_RATE_LIMIT_EXIT_CODE``, never counts as a failure),
@@ -246,7 +246,7 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     return ("unknown", None)
 
 
-def _exit_code_kind(code: int) -> "tuple[str, int]":
+def _exit_code_kind(code: int) -> tuple[str, int]:
     """``(kind, code)`` for a worker's exit code, however it was observed."""
     if code == 0:
         return ("clean_exit", 0)
@@ -278,12 +278,12 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
     return int(matches[-1]) if matches else None
 
 
-def reap_worker_zombies() -> "list[int]":
+def reap_worker_zombies() -> list[int]:
     """Reap exited workers without blocking; returns reaped PIDs. POSIX reaps
     every child via ``waitpid(-1)``; Windows polls the ``Popen`` handles
     parked by ``_default_spawn`` (the only way to learn a child's exit code
     there), so the rate-limit sentinel exit is classified on both hosts."""
-    reaped: "list[int]" = []
+    reaped: list[int] = []
     if _kb._IS_WINDOWS:
         for pid, proc in list(_live_worker_procs.items()):
             returncode = proc.poll()
@@ -612,9 +612,9 @@ def heartbeat_worker(
     task_id: str,
     *,
     note: Optional[str] = None,
-    expected_run_id: Optional[int] = None,
+    expected_run_id: Optional[int] = None, actor: Optional[str] = None,
 ) -> bool:
-    """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
+    """Record a ``heartbeat`` event naming its ``actor`` + touch ``last_heartbeat_at`` (no claim renewal).
 
     Liveness signal orthogonal to the PID check: a worker whose forked child
     (train loop, crawl) is stuck can still have a live Python process.
@@ -639,7 +639,7 @@ def heartbeat_worker(
             conn.execute("UPDATE task_runs SET last_heartbeat_at = ? WHERE id = ?", (now, run_id))
         _kb._append_event(
             conn, task_id, "heartbeat",
-            {"note": note} if note else None,
+            {**({"note": note} if note else {}), "actor": _kb.resolve_actor(actor)},
             run_id=run_id,
         )
     return True
@@ -1878,19 +1878,18 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
-def count_running_tasks(conn: sqlite3.Connection) -> int:
+def count_running_tasks(conn: sqlite3.Connection, board: Optional[str] = None) -> int:
     """Number of tasks in ``status='running'``.
 
     Used by the multi-board sweep to count OTHER boards' workers against the
     host-level budget — the memory-derived cap bounds the machine, not the
     board. Fails open to 0 so a broken board doesn't brick dispatch on healthy ones.
+    On a harness ``board`` only rows with a worker pid count; CLI claims there use no host slot (F-040).
     """
+    from hermes_cli.kanban_dispatch_scope import HARNESS_BOARDS
+    sql = "SELECT COUNT(*) FROM tasks WHERE status = 'running'" + (" AND worker_pid IS NOT NULL" if board in HARNESS_BOARDS else "")
     try:
-        return int(
-            conn.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-            ).fetchone()[0]
-        )
+        return int(conn.execute(sql).fetchone()[0])
     except Exception:
         return 0
 
@@ -1923,7 +1922,7 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
                 continue
             other = _kbc.connect(board=slug)
             try:
-                total += count_running_tasks(other)
+                total += count_running_tasks(other, board=slug)
             finally:
                 with contextlib.suppress(Exception):
                     other.close()
@@ -2081,7 +2080,7 @@ def _dispatch_lane_task(
     conn: sqlite3.Connection,
     row: sqlite3.Row,
     assignee: str,
-    result: "DispatchResult",
+    result: DispatchResult,
     *,
     lane: str,
     dry_run: bool,
@@ -2299,7 +2298,7 @@ def _tick_spawn_budget(
         spawn_budget = max_spawn - running_count
 
     if max_in_progress is not None:
-        total_running = running_count + (count_running_tasks_other_boards(board)
+        total_running = count_running_tasks(conn, board=board) + (count_running_tasks_other_boards(board)
                                          if other_board_running is None else other_board_running)
         if total_running >= max_in_progress:
             return False, None
@@ -2956,10 +2955,10 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         strip_launch_profile_env(env, profile_home)
     # A direct private LAN provider is pinned for this worker and its auxiliary calls.
     if profile_home and task.provider_override and task.model_override:
-        import hermes_yaml as yaml
+        from hermes_cli.config import read_user_config_raw
         from hermes_cli.kanban_ready_cycle import approvals
         try:
-            cfg = yaml.safe_load((Path(profile_home) / "config.yaml").read_text()) or {}
+            cfg = read_user_config_raw(Path(profile_home) / "config.yaml")
             route = ((cfg.get("providers") or {}) if isinstance(cfg, dict) else {}).get(task.provider_override) or {}
             endpoint = (route.get("base_url") or "") if isinstance(route, dict) else ""
         except Exception:
@@ -2978,17 +2977,12 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # Tag the session `kanban` so session-browsing surfaces filter it out by
     # source instead of rendering one sidebar row per attempt.
     env["HERMES_SESSION_SOURCE"] = "kanban"
-    # TERMINAL_CWD takes precedence over process cwd in file_tools and
-    # build_context_files_prompt; without it relative writes land in the gateway
-    # user's home and workers load the gateway's AGENTS.md. file_tools rejects
-    # relative / sentinel values, so only set a real absolute directory.
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and context-file loader anchor on
     # the workspace, not whatever cwd the dispatching gateway happened to export. The worker subprocess is
     # already launched with cwd=workspace, but TERMINAL_CWD takes precedence over the process cwd in both
     # file_tools._resolve_base_dir (#41312 — relative write_file paths were landing in the gateway user's
     # home) and build_context_files_prompt (#34619 — workers loaded the dispatching gateway's AGENTS.md
-    # instead of the task's). Setting it to the workspace fixes both: the workspace is where the task's work
-    # actually happens.
+    # instead of the task's). file_tools rejects relative / sentinel values, so only a real absolute dir.
     if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
         env["TERMINAL_CWD"] = workspace
     if task.branch_name:
@@ -3018,9 +3012,11 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # kanban_comment reads HERMES_PROFILE for its default author; `-p` alone
     # doesn't set the env var.
     env["HERMES_PROFILE"] = profile_arg
-    # This is the grant boundary: the dispatcher assigned this new worker's task.
+    # This is the grant boundary: the dispatcher assigned this new worker's task, which it holds as its
+    # own HERMES_KANBAN_CLAIM_LOCK, never as the external harness a parent shell's claimer names.
     from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
     env.pop(DELEGATED_CHILD_ENV_MARKER, None)
+    env.pop("HERMES_KANBAN_CLAIMER", None)
     # `--cli` is the highest-precedence TUI override; dropping HERMES_TUI covers
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)

@@ -206,6 +206,18 @@ def _profile_author() -> str:
     return current_profile_name("user") or "user"
 
 
+def _comment_author(args: argparse.Namespace) -> str:
+    """Author of a comment a verb writes: ``--author`` when the verb has it, else the event
+    ``actor`` (:func:`kanban_db.resolve_actor`'s order) when it is a named ``<kind>:<id>``
+    holder, else the profile. A ``host:pid`` actor -- an anonymous claim, or a dispatched
+    worker's own lock, which outranks ``$HERMES_KANBAN_CLAIMER`` -- is never an author: the
+    worker speaks as its profile, as its ``kanban_comment`` tool does."""
+    if getattr(args, "author", None):
+        return args.author
+    actor = kb.resolve_actor(getattr(args, "claimer", None))
+    return actor if kb.is_named_claim(actor) else _profile_author()
+
+
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
     "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
@@ -311,11 +323,27 @@ def _cmd_init(args: argparse.Namespace) -> int:
 
 
 def _cmd_heartbeat(args: argparse.Namespace) -> int:
+    tid, ttl = args.task_id, getattr(args, "ttl", None)
+    # A dispatcher-pinned worker keeps its own lock even if the env also names a claimer.
+    worker_lock = os.environ.get("HERMES_KANBAN_CLAIM_LOCK")
+    claimer = getattr(args, "claimer", None) if worker_lock else _named_claimer(args)
+    if ttl is not None and not (claimer or worker_lock):
+        return _err(f"cannot heartbeat {tid}: --ttl renews a claim; pass --claimer <kind>:<id>", 2)
     with kbc.connect_closing() as conn:
-        ok = kbd.heartbeat_worker(conn, args.task_id, note=getattr(args, "note", None),
-                                 expected_run_id=_worker_run_id_for(args.task_id))
-    return _ok_or_err(ok, f"cannot heartbeat {args.task_id} (not running?)",
-                      f"Heartbeat recorded for {args.task_id}")
+        # Resolved before any write: it runs the worker-scope guard, and the heartbeat
+        # event below CASes on the run whose claim was renewed.
+        run_id = _owned_run_id(conn, tid, claimer)
+        if claimer:
+            if run_id is None or not kb.heartbeat_claim(conn, tid, ttl_seconds=ttl, claimer=claimer):
+                return _err(f"cannot heartbeat {tid}: its claim is not held by {claimer} "
+                            f"(expired, reclaimed, or never claimed); claim it again")
+        elif worker_lock:
+            # Same as the kanban_heartbeat tool: renewal is best effort, the event is the signal.
+            kb.heartbeat_claim(conn, tid, ttl_seconds=ttl, claimer=worker_lock)
+        ok = kbd.heartbeat_worker(conn, tid, note=getattr(args, "note", None), expected_run_id=run_id,
+                                 actor=claimer)
+    return _ok_or_err(ok, f"cannot heartbeat {tid} (not running?)",
+                      f"Heartbeat recorded for {tid}")
 
 
 def _cmd_assignees(args: argparse.Namespace) -> int:
@@ -664,11 +692,22 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     if dl:
                         diags_by_task[tid] = dl
 
+        # Board-wide: ready work the reviewed dispatch scope admits none of (F-039).
+        from hermes_cli.kanban_dispatch_scope import admission
+        board = kb.get_current_board()
+        try:
+            board_diags = kd.compute_dispatch_diagnostics(
+                board, *admission(conn, board, diag_config.get("kanban") or {}, kb))
+        except Exception as exc:  # never lose the per-task diagnostics; say why this part is missing
+            print(f"kanban: dispatch-scope check failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+            board_diags = []
+
         sev = getattr(args, "severity", None)
         if sev:
             floor = kd.SEVERITY_ORDER.index(sev)
             diags_by_task = {tid: kept for tid, dl in diags_by_task.items()
                              if (kept := [d for d in dl if kd.SEVERITY_ORDER.index(d.severity) >= floor])}
+            board_diags = [d for d in board_diags if kd.SEVERITY_ORDER.index(d.severity) >= floor]
 
         # Map task_id → title/status/assignee for the table output.
         meta: dict[str, dict] = {}
@@ -682,16 +721,22 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     allowlist = kbd.dispatch_profile_allowlist_summary()
 
     if getattr(args, "json", False):
-        # Per-task rows unchanged; the home-scope allowlist rides as a trailing row
-        # (task_id null) so existing `payload[0]["diagnostics"]` consumers keep working.
+        # Per-task rows unchanged; the home-scope allowlist and board-wide diagnostics ride as a
+        # trailing row (task_id null) so existing `payload[0]["diagnostics"]` consumers keep working.
         _print_json([{"task_id": tid, **meta.get(tid, {}), "diagnostics": [d.to_dict() for d in dl]}
                      for tid, dl in diags_by_task.items()]
-                    + [{"task_id": None, "dispatch_profiles": allowlist, "diagnostics": []}])
+                    + [{"task_id": None, "dispatch_profiles": allowlist,
+                        "diagnostics": [d.to_dict() for d in board_diags]}])
         return 0
 
     print(f"kanban.dispatch_profiles: {allowlist}")
+    if board_diags:
+        print(f"Board {board}:")
+        _print_diagnostics(board_diags, "    ", with_kind=True)
+        print()
     if not diags_by_task:
-        print("No active diagnostics on this board.")
+        if not board_diags:
+            print("No active diagnostics on this board.")
         return 0
 
     total = sum(len(dl) for dl in diags_by_task.values())
@@ -734,8 +779,13 @@ def _cmd_unlink(args: argparse.Namespace) -> int:
 
 
 def _cmd_claim(args: argparse.Namespace) -> int:
+    claimer = _named_claimer(args)
+    if claimer:
+        problem = kb.claimer_problem(claimer)
+        if problem:
+            return _err(f"cannot claim {args.task_id}: {problem}", 2)
     with kbc.connect_closing() as conn:
-        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl)
+        task = kb.claim_task(conn, args.task_id, ttl_seconds=args.ttl, claimer=claimer)
         if task is None:
             existing = kb.get_task(conn, args.task_id)
             if existing is None:
@@ -744,7 +794,10 @@ def _cmd_claim(args: argparse.Namespace) -> int:
                         f"lock={existing.claim_lock or '(none)'}")
         workspace = kbw.resolve_workspace(task)
         kbw.set_workspace_path(conn, task.id, str(workspace))
-    print(f"Claimed {task.id}\nWorkspace: {workspace}")
+    print(f"Claimed {task.id}\nWorkspace: {workspace}\nClaimer: {task.claim_lock}")
+    if not claimer:
+        print("note: this claim names no holder, so it cannot be renewed and does not protect the "
+              "card; pass --claimer <kind>:<id> (or set HERMES_KANBAN_CLAIMER)", file=sys.stderr)
     return 0
 
 
@@ -756,7 +809,8 @@ def _cmd_comment(args: argparse.Namespace) -> int:
         if len(body) > args.max_len:
             suffix = f"\n\n[trimmed to {args.max_len} chars by --max-len]"
             body = body[: max(0, args.max_len - len(suffix))].rstrip() + suffix
-    author = args.author or _profile_author()
+    # An external harness that set its claimer speaks as that claimer, not as the profile.
+    author = _comment_author(args)
     with kbc.connect_closing() as conn:
         kb.add_comment(conn, args.task_id, author, body)
     print(f"Comment added to {args.task_id}")
@@ -824,6 +878,26 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return int(raw)
     except ValueError:
         return None
+
+
+def _named_claimer(args: argparse.Namespace) -> Optional[str]:
+    """The external holder (``<kind>:<id>``) this command speaks for: ``--claimer``,
+    else ``$HERMES_KANBAN_CLAIMER``."""
+    # Per-session identity, not configuration: config.yaml is shared by every session of a
+    # profile, and the holder name is no secret (same class as HERMES_KANBAN_CLAIM_LOCK).
+    env_claimer = os.environ.get("HERMES_KANBAN_CLAIMER")  # health: allow HX002 -- per-session holder identity
+    return getattr(args, "claimer", None) or env_claimer or None
+
+
+def _owned_run_id(conn, task_id: str, claimer: Optional[str]) -> Optional[int]:
+    """The run the caller can prove it owns: a worker's pinned run, else the current run
+    when ``claimer`` holds the task's claim. complete/request_review CAS on that run id,
+    so a claim lost after this read still refuses."""
+    run_id = _worker_run_id_for(task_id)
+    if run_id is not None or not claimer:
+        return run_id
+    task = kb.get_task(conn, task_id)
+    return task.current_run_id if task and task.claim_lock == claimer else None
 
 
 def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str):
@@ -908,7 +982,17 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     metadata, rc = _parse_metadata_flag(raw_meta)
     if rc:
         return rc
+    force = bool(getattr(args, "force", False))
+    force_reason = (getattr(args, "reason", None) or "").strip() or None
+    if force_reason and not force:
+        return _err("kanban complete: --reason explains an override; pass it with --force "
+                    "(or drop --reason)", 2)
+    if force and not force_reason:
+        # Bare --force predates --reason and callers rely on it: warn, do not refuse.
+        print("warning: --force without --reason; say why with --reason TEXT "
+              "(it is recorded on the completed event)", file=sys.stderr)
     fail_msg: dict[str, str] = {}
+    claimer = _named_claimer(args)
     with kbc.connect_closing() as conn:
         def op(tid):
             gate_err = _goal_gate_error(
@@ -921,12 +1005,21 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
-                                        expected_run_id=_worker_run_id_for(tid),
-                                        force=bool(getattr(args, "force", False)))
-            except kb.LiveClaimError:
-                fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
-                                 f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
-                                 f"--force to close its run and complete anyway.")
+                                        expected_run_id=_owned_run_id(conn, tid, claimer),
+                                        force=force, force_reason=force_reason,
+                                        actor=getattr(args, "claimer", None))
+            except kb.LiveClaimError as claim_err:
+                # The lock that refused, read inside complete_task's txn: no re-read, so a
+                # task removed meanwhile cannot break the message.
+                lock = claim_err.holder
+                if kb.is_named_claim(lock):
+                    fail_msg[tid] = (f"cannot complete {tid}: it is claimed by {lock}. Complete it as "
+                                     f"that holder (--claimer {lock}), `hermes kanban reclaim {tid}` to "
+                                     f"release it, or re-run with --force --reason TEXT to complete anyway.")
+                else:
+                    fail_msg[tid] = (f"cannot complete {tid}: a live worker is running it. Wait for the "
+                                     f"worker, `hermes kanban reclaim {tid}` to release it, or re-run with "
+                                     f"--force --reason TEXT to close its run and complete anyway.")
                 return False
             except kb.EmptyCompletionError as empty_err:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
@@ -972,20 +1065,37 @@ def _cmd_edit(args: argparse.Namespace) -> int:
 
 
 def _commented(conn, reason: Optional[str], author, prefix: str, op):
-    """Wrap a per-task ``op`` so a ``reason`` is first recorded as a ``PREFIX: reason`` comment."""
+    """Wrap a per-task ``op`` so a ``reason`` is recorded as a ``PREFIX: reason`` comment once
+    ``op`` succeeds: a refused block must not leave its reason on a card someone else holds."""
     def run(tid):
-        if reason:
+        done = op(tid)
+        if done and reason:
             kb.add_comment(conn, tid, author, f"{prefix}: {reason}")
-        return op(tid)
+        return done
+    return run
+
+
+def _fenced(conn, verb: str, claimer: Optional[str], fail_msg: dict, op):
+    """Per-task ``op(tid, run_id)`` for a verb that clears a claim: passes the run the caller
+    owns, and turns a live-claim refusal into a message naming the holder."""
+    def run(tid):
+        try:
+            return op(tid, _owned_run_id(conn, tid, claimer))
+        except kb.LiveClaimError as err:
+            holder = f"it is claimed by {err.holder}" if kb.is_named_claim(err.holder) else "a live worker is running it"
+            fail_msg[tid] = (f"cannot {verb} {tid}: {holder}. Act as that holder (--claimer), "
+                             f"`hermes kanban reclaim {tid}` to release it, or re-run with --force.")
+            return False
     return run
 
 
 def _cmd_block(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
     kind = getattr(args, "kind", None)
-    author = _profile_author()
+    author = _comment_author(args)
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
         def ok_msg(tid):
             # Report where it landed: dependency blocks -> todo, tripped unblock-loop breaker -> triage.
@@ -1002,20 +1112,25 @@ def _cmd_block(args: argparse.Namespace) -> int:
                 return f"{tid} → triage (unblock loop detected — {verdict}){suffix}"
             return f"Blocked {tid}{suffix}"
 
-        op = _commented(conn, reason, author, "BLOCKED", lambda tid: kb.block_task(
-            conn, tid, reason=reason, kind=kind, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, ok_msg, lambda tid: f"cannot block {tid}")
+        op = _commented(conn, reason, author, "BLOCKED", _fenced(
+            conn, "block", _named_claimer(args), fail_msg, lambda tid, run_id: kb.block_task(
+                conn, tid, reason=reason, kind=kind, expected_run_id=run_id,
+                force=bool(getattr(args, "force", False)), actor=getattr(args, "claimer", None))))
+        return _bulk_apply(ids, op, ok_msg, lambda tid: fail_msg.get(tid, f"cannot block {tid}"))
 
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
     reason = _joined_words(args.reason)
-    author = _profile_author()
+    author = _comment_author(args)
     ids = _bulk_ids(args)
     suffix = f": {reason}" if reason else ""
+    fail_msg: dict[str, str] = {}
     with kbc.connect_closing() as conn:
-        op = _commented(conn, reason, author, "SCHEDULED", lambda tid: kb.schedule_task(
-            conn, tid, reason=reason, expected_run_id=_worker_run_id_for(tid)))
-        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}", lambda tid: f"cannot schedule {tid}")
+        op = _commented(conn, reason, author, "SCHEDULED", _fenced(
+            conn, "schedule", _named_claimer(args), fail_msg, lambda tid, run_id: kb.schedule_task(
+                conn, tid, reason=reason, expected_run_id=run_id, force=bool(getattr(args, "force", False)))))
+        return _bulk_apply(ids, op, lambda tid: f"Scheduled {tid}{suffix}",
+                           lambda tid: fail_msg.get(tid, f"cannot schedule {tid}"))
 
 
 def _cmd_unblock(args: argparse.Namespace) -> int:
@@ -1048,7 +1163,8 @@ def _cmd_request_review(args: argparse.Namespace) -> int:
             return _err(gate_err)
         ok, reason = kb.request_review(
             conn, tid, summary=summary, metadata=metadata, reviewer=getattr(args, "reviewer", None),
-            expected_run_id=_worker_run_id_for(tid), force=bool(getattr(args, "force", False)), with_reason=True)
+            expected_run_id=_owned_run_id(conn, tid, _named_claimer(args)),
+            force=bool(getattr(args, "force", False)), with_reason=True)
         if not ok:
             return _err(f"cannot request review for {tid}: {reason or 'not running/ready?'}")
         persisted_run = kb.latest_run(conn, tid)

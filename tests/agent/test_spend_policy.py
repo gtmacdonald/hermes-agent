@@ -23,7 +23,7 @@ def _policy(tmp_path, *, expires=None, enforcement="deny", require_zdr=False):
             "require_zdr": require_zdr}
     cfg = {"version": 1, "enforcement": enforcement, "expires_on": expires,
            "limits": {"max_output_tokens": 4096, "max_body_bytes": 200_000},
-           "price_ceiling": {"input_usd_per_million": 1.0, "output_usd_per_million": 5.0},
+           "max_usd_per_million_tokens": 4.0,
            "lanes": {"openrouter": {"models": {MODEL: dict(spec)}}, "vercel": {"models": {MODEL: dict(spec)}}}}
     path = tmp_path / "policy.json"
     path.write_text(json.dumps(cfg))
@@ -74,10 +74,27 @@ def test_openrouter_admission_caps_tokens_and_pins_providers(tmp_path):
     assert sp.prepare(OPENROUTER, _body(max_tokens=50), policy_path=_policy(tmp_path))["max_tokens"] == 50
 
 
-def test_vercel_admission_pins_gateway_providers(tmp_path):
-    out = sp.prepare(VERCEL, _body(), policy_path=_policy(tmp_path, require_zdr=True))
-    assert out["providerOptions"]["gateway"] == {"only": ["google-vertex"], "zeroDataRetention": True}
-    assert out["max_tokens"] == 4096
+def test_vercel_chat_is_denied_even_when_the_policy_lists_it(tmp_path):
+    """Greg 2026-10-10: Vercel is the native decision backup only, whatever the policy file says."""
+    with pytest.raises(sp.SpendDenied, match="only the three native decision backups"):
+        sp.prepare(VERCEL, _body(), policy_path=_policy(tmp_path, require_zdr=True))
+
+
+@pytest.mark.parametrize("model", ["typesafe-ai/jev", "microsoft/microsoft-decision-1", "liquid/d1"])
+def test_vercel_native_decision_backup_passes_the_fence(tmp_path, model):
+    """A native decision call clears the Vercel fence and then meets the ordinary policy check."""
+    url = "https://ai-gateway.vercel.sh/v1/evaluate"
+    body = {"model": model, "state": "s", "questions": ["q"]}
+    with pytest.raises(sp.SpendDenied) as denied:
+        sp.prepare(url, body, policy_path=_policy(tmp_path))
+    assert "native decision backups" not in str(denied.value)
+
+
+@pytest.mark.parametrize("model,path", [("typesafe-ai/jev", "/v1/chat/completions"), (MODEL, "/v1/evaluate")])
+def test_vercel_fence_needs_both_a_decision_model_and_the_evaluate_path(tmp_path, model, path):
+    with pytest.raises(sp.SpendDenied, match="only the three native decision backups"):
+        sp.prepare("https://ai-gateway.vercel.sh" + path, {"model": model, "state": "s", "questions": ["q"]},
+                   policy_path=_policy(tmp_path))
 
 
 @pytest.mark.parametrize("extra", [
@@ -112,3 +129,93 @@ def test_guarded_sdk_client_rewrites_admitted_and_blocks_denied_requests(tmp_pat
     # Guarding twice does not stack hooks.
     assert sp.guard_client(client) is client
     assert client._client.event_hooks["request"].count(sp.httpx_hook) == 1
+
+
+@pytest.mark.parametrize('input_rate,output_rate,allowed', [
+    (0, 0, True), (3.9, 3.9, True), (4, .1, True), (.1, 4, True), (4, 4, True),
+    (4.000001, .1, False), (.1, 4.000001, False), (4.1, 4.1, False),
+    (-1, .1, False), (.1, -1, False), (True, .1, False), (.1, True, False),
+    (float('nan'), .1, False), (.1, float('nan'), False),
+    (float('inf'), .1, False), (.1, float('inf'), False),
+    ('1', .1, False), (.1, '1', False), (None, .1, False), (.1, None, False),
+])
+def test_single_ceiling_uses_max_of_both_validated_rates(tmp_path, input_rate, output_rate, allowed):
+    path = _policy(tmp_path)
+    cfg = json.loads(path.read_text())
+    for lane in cfg['lanes'].values():
+        spec = lane['models'][MODEL]
+        spec.update(input_usd_per_million=input_rate, output_usd_per_million=output_rate)
+    path.write_text(json.dumps(cfg))
+    for url in (OPENROUTER,):  # Vercel carries only native decision backups (fence test above)
+        if not allowed:
+            with pytest.raises(sp.SpendDenied):
+                sp.prepare(url, _body(), policy_path=path)
+        else:
+            out = sp.prepare(url, _body(), policy_path=path)
+            assert out['max_tokens'] == cfg['limits']['max_output_tokens']
+            assert out['provider']['max_price'] == {'prompt': input_rate, 'completion': output_rate, 'request': 0}
+            assert out['provider']['only'] == cfg['lanes']['openrouter']['models'][MODEL]['providers']
+            assert out['provider']['allow_fallbacks'] is False
+
+
+@pytest.mark.parametrize('ceiling', [-1, True, None, '4', float('nan'), float('inf'), {}, []])
+def test_invalid_single_ceiling_denies_instead_of_using_legacy_limits(tmp_path, ceiling):
+    path = _policy(tmp_path)
+    cfg = json.loads(path.read_text())
+    cfg['max_usd_per_million_tokens'] = ceiling
+    cfg['price_ceiling'] = {'input_usd_per_million': 100, 'output_usd_per_million': 100}
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(sp.SpendDenied):
+        sp.prepare(VERCEL, _body(), policy_path=path)
+
+
+@pytest.mark.parametrize('copies,allowed', [
+    ({'input_usd_per_million': 4, 'output_usd_per_million': 4}, True),
+    ({'input_usd_per_million': 3, 'output_usd_per_million': 4}, False),
+    ({'input_usd_per_million': 4, 'output_usd_per_million': 3}, False),
+    ({'input_usd_per_million': 5, 'output_usd_per_million': 4}, False),
+    ({'input_usd_per_million': 4, 'output_usd_per_million': 5}, False),
+    ({'input_usd_per_million': True, 'output_usd_per_million': 4}, False),
+    ({'input_usd_per_million': 4, 'output_usd_per_million': '4'}, False),
+    ({'input_usd_per_million': float('nan'), 'output_usd_per_million': 4}, False),
+    ({'input_usd_per_million': 4, 'output_usd_per_million': float('inf')}, False),
+    ({'input_usd_per_million': 4}, False),
+    ({'input_usd_per_million': 4, 'output_usd_per_million': 4, 'extra': 4}, False),
+    (None, False), ([], False), (4, False),
+])
+def test_legacy_compatibility_copies_must_match_authoritative_scalar(tmp_path, copies, allowed):
+    path = _policy(tmp_path)
+    cfg = json.loads(path.read_text())
+    cfg['price_ceiling'] = copies
+    path.write_text(json.dumps(cfg))
+    for url in (OPENROUTER,):  # Vercel carries only native decision backups (fence test above)
+        if allowed:
+            assert sp.prepare(url, _body(), policy_path=path)['max_tokens'] == cfg['limits']['max_output_tokens']
+        else:
+            with pytest.raises(sp.SpendDenied):
+                sp.prepare(url, _body(), policy_path=path)
+
+
+def test_legacy_only_policy_cannot_override_missing_authoritative_scalar(tmp_path):
+    path = _policy(tmp_path)
+    cfg = json.loads(path.read_text())
+    del cfg['max_usd_per_million_tokens']
+    cfg['price_ceiling'] = {'input_usd_per_million': 4, 'output_usd_per_million': 4}
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(sp.SpendDenied):
+        sp.prepare(VERCEL, _body(), policy_path=path)
+
+
+@pytest.mark.parametrize("field", ["max_usd_per_million_tokens", "price"])
+def test_oversized_policy_numbers_deny_instead_of_crashing(tmp_path, field):
+    """CodeRabbit (PR 20): an integer too large for a float must deny, not raise OverflowError."""
+    path = _policy(tmp_path)
+    cfg = json.loads(path.read_text())
+    huge = 10 ** 400
+    if field == "price":
+        cfg["lanes"]["openrouter"]["models"][MODEL]["input_usd_per_million"] = huge
+    else:
+        cfg[field] = huge
+    path.write_text(json.dumps(cfg))
+    with pytest.raises(sp.SpendDenied):
+        sp.prepare(OPENROUTER, _body(), policy_path=path)

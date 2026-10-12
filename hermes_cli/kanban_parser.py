@@ -84,6 +84,11 @@ _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
 _PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
+_CLAIMER = _arg("--claimer", help="Who holds the claim, as <kind>:<id> (e.g. claude:<session-id>); "
+                                  "default: $HERMES_KANBAN_CLAIMER. Cooperative: it keeps harnesses from "
+                                  "colliding, it does not authenticate them")
+_CLEAR_FORCE_HELP = ("Override the live-claim guard: park a running card someone else holds "
+                     "(ends their run; the holder can pass --claimer instead).")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
     _arg("--chat-id", required=True),
@@ -275,8 +280,11 @@ _SPECS = [
     _cmd("unlink", [_arg("parent_id"), _arg("child_id")], help="Remove a parent->child dependency"),
     _cmd("claim", [
         _TASK_ID,
-        _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS, help="Claim TTL in seconds (default: 900)"),
-    ], help="Atomically claim a ready task (prints resolved workspace path)"),
+        _arg("--ttl", type=int, default=kb.DEFAULT_CLAIM_TTL_SECONDS,
+             help="Claim TTL in seconds (default: 900). A turn-based harness cannot heartbeat "
+                  "while idle, so size it to the whole job (e.g. 14400)"),
+        _CLAIMER,
+    ], help="Atomically claim a ready task (prints resolved workspace path); renew with heartbeat"),
     _cmd("comment", [
         _TASK_ID,
         _arg("text", nargs="+", help="Comment body"),
@@ -302,8 +310,11 @@ _SPECS = [
                   '"tests_run": 12}\'). Stored on the closing run.'),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: complete a running, claimed task "
-                  "even without owning its run (closes the worker's run)."),
-    ], help="Mark one or more tasks done"),
+                  "even without owning its run (closes the worker's run). Pair it with --reason."),
+        _arg("--reason", help="Why --force overrides the claim; recorded as forced_reason on the "
+                              "completed event (--force without it warns)"),
+        _CLAIMER,
+    ], help="Mark one or more tasks done; a card someone else holds needs --force --reason"),
     _cmd("edit", [
         _TASK_ID,
         _arg("--title", help="Replace the task title"),
@@ -322,11 +333,13 @@ _SPECS = [
                   "blocked for a human; 'transient' marks a maybe-flaky failure. "
                   "Repeated same-kind re-blocks after unblock route the task to "
                   "triage to break unblock loops. Omit for a generic block."),
+        _CLAIMER, _arg("--force", action="store_true", help=_CLEAR_FORCE_HELP),
     ], help="Mark one or more tasks blocked"),
     _cmd("schedule", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
         _bulk_ids("schedule"),
+        _CLAIMER, _arg("--force", action="store_true", help=_CLEAR_FORCE_HELP),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
@@ -340,6 +353,7 @@ _SPECS = [
         _arg("--force", action="store_true",
              help="Override the live-claim guard: move a running, claimed "
                   "task to review even without owning its run (clears the worker's claim)."),
+        _CLAIMER,
     ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),
@@ -420,7 +434,9 @@ _SPECS = [
     _cmd("heartbeat", [
         _TASK_ID,
         _arg("--note", help="Optional short note attached to the heartbeat event"),
-    ], help="Emit a heartbeat event for a running task (worker liveness signal)"),
+        _CLAIMER,
+        _arg("--ttl", type=int, help="Renew a named claim for this many seconds (default: the claim TTL, 900)"),
+    ], help="Emit a heartbeat event for a running task; with a claimer, also renew its claim"),
     _cmd("assignees", [_json_flag()],
          help="List known profiles + per-profile task counts (union of ~/.hermes/profiles/ and current assignees on the board)"),
     _cmd("context", [_TASK_ID],
