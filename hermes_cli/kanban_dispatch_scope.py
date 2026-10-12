@@ -233,3 +233,83 @@ def starved_boards_readonly(kb, kanban_cfg, *, ready_cycle=None):
         if waiting and not admitted:
             starved[slug] = len(waiting)
     return starved, unreadable
+
+
+def persist_reviewed_policy(conn, claimed, policy):
+    """Record the admission's worker policy on the claimed run before spawning.
+
+    No policy (an unscoped or policy-less admission) leaves the run and argv as before.
+    """
+    if not policy:
+        return
+    from hermes_cli import kanban_db as kb
+    from hermes_cli.kanban_db_completion import REVIEWED_POLICY_KEY
+    claimed._reviewed_worker_policy = dict(policy)
+    with kb.write_txn(conn):
+        current = conn.execute("SELECT current_run_id, status FROM tasks WHERE id=?",
+                               (claimed.id,)).fetchone()
+        if current is None or current["status"] != "running" or current["current_run_id"] != claimed.current_run_id:
+            raise RuntimeError("reviewed worker claim changed before policy persistence")
+        prior = conn.execute("SELECT metadata FROM task_runs WHERE id=?",
+                             (claimed.current_run_id,)).fetchone()
+        metadata = json.loads(prior["metadata"] or "{}")
+        metadata[REVIEWED_POLICY_KEY] = dict(policy)
+        conn.execute("UPDATE task_runs SET metadata=? WHERE id=?",
+                     (json.dumps(metadata), claimed.current_run_id))
+        kb._append_event(conn, claimed.id, REVIEWED_POLICY_KEY, policy, run_id=claimed.current_run_id)
+
+
+def reviewed_worker_args(task):
+    """Native CLI limits for a reviewed run; [] keeps the profile's own limits."""
+    policy = getattr(task, "_reviewed_worker_policy", None)
+    if not policy:
+        return []
+    return ["--max-turns", str(policy["max_turns"]),
+            "--run-budget", str(policy["run_budget_seconds"])]
+
+
+def dispatch_reviewed_once(conn, scope, *, board, spawn_fn, dry_run, max_spawn,
+                           max_in_progress, failure_limit, ttl_seconds, per_profile_cap,
+                           stale_timeout_seconds=0, reconcile_orphans=True):
+    """Finite automatic scope: no board-wide promotion or review dispatch.
+
+    Running workers keep their normal lifecycle: crash, stale, orphan and max-runtime
+    sweeps run every tick, as upstream (without promotion). Failed attempts
+    require a new reviewed approval naming the exact latest run; reclaiming a
+    card back to ready never renews its consumed admission automatically.
+    """
+    from hermes_cli import kanban_db_dispatch as kbd
+    result = kbd.DispatchResult()
+    kbd._run_reclaim_phase(conn, result, stale_timeout_seconds=stale_timeout_seconds,
+                           failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
+                           board=board, promote=False)
+    entries = reviewed_entries(scope, board)
+    if not entries:
+        return result
+    other_running = other_running_readonly(kbd._kb, board)
+    if other_running is None:
+        return result
+    may_spawn, budget = kbd._tick_spawn_budget(conn, result, max_spawn=max_spawn,
+                                               max_in_progress=max_in_progress, board=board,
+                                               other_board_running=other_running)
+    if not may_spawn:
+        return result
+    running = {r["assignee"]: r["n"] for r in conn.execute(
+        "SELECT assignee, COUNT(*) AS n FROM tasks WHERE status='running' GROUP BY assignee")}
+    used = 0
+    for entry in entries:
+        if budget is not None and used >= budget:
+            break
+        if not eligible(conn, entry):
+            continue
+        row = conn.execute("SELECT id, assignee FROM tasks WHERE id=?", (entry["task_id"],)).fetchone()
+        if row is None:  # deleted between the eligibility read and this one
+            continue
+        if kbd._dispatch_lane_task(conn, row, row["assignee"], result, lane="ready",
+                                   dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
+                                   failure_limit=failure_limit, spawn_fn=spawn_fn,
+                                   per_profile_cap=per_profile_cap, per_profile_running=running,
+                                   eligibility_guard=lambda c, e=entry: eligible(c, e),
+                                   reviewed_policy=worker_policy(entry)):
+            used += 1
+    return result

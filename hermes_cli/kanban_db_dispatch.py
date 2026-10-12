@@ -1976,7 +1976,8 @@ def dispatch_once(
     """
     def _locked_tick() -> DispatchResult:
         if eligibility_scope is not None:
-            return _dispatch_reviewed_once(
+            from hermes_cli.kanban_dispatch_scope import dispatch_reviewed_once
+            return dispatch_reviewed_once(
                 conn, eligibility_scope, board=board, spawn_fn=spawn_fn, dry_run=dry_run,
                 max_spawn=max_spawn, max_in_progress=max_in_progress,
                 failure_limit=failure_limit, ttl_seconds=ttl_seconds,
@@ -2014,53 +2015,6 @@ def dispatch_once(
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
-    return result
-
-
-def _dispatch_reviewed_once(conn, scope, *, board, spawn_fn, dry_run, max_spawn,
-                            max_in_progress, failure_limit, ttl_seconds, per_profile_cap,
-                            stale_timeout_seconds=0, reconcile_orphans=True):
-    """Finite automatic scope: no board-wide promotion or review dispatch.
-
-    Running workers keep their normal lifecycle: crash, stale, orphan and max-runtime
-    sweeps run every tick, as upstream (without promotion). Failed attempts
-    require a new reviewed approval naming the exact latest run; reclaiming a
-    card back to ready never renews its consumed admission automatically.
-    """
-    from hermes_cli.kanban_dispatch_scope import reviewed_entries, eligible, other_running_readonly, worker_policy
-    result = DispatchResult()
-    _run_reclaim_phase(conn, result, stale_timeout_seconds=stale_timeout_seconds,
-                       failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
-                       board=board, promote=False)
-    entries = reviewed_entries(scope, board)
-    if not entries:
-        return result
-    other_running = other_running_readonly(_kb, board)
-    if other_running is None:
-        return result
-    may_spawn, budget = _tick_spawn_budget(conn, result, max_spawn=max_spawn,
-                                         max_in_progress=max_in_progress, board=board,
-                                         other_board_running=other_running)
-    if not may_spawn:
-        return result
-    running = {r["assignee"]: r["n"] for r in conn.execute(
-        "SELECT assignee, COUNT(*) AS n FROM tasks WHERE status='running' GROUP BY assignee")}
-    used = 0
-    for entry in entries:
-        if budget is not None and used >= budget:
-            break
-        if not eligible(conn, entry):
-            continue
-        row = conn.execute("SELECT id, assignee FROM tasks WHERE id=?", (entry["task_id"],)).fetchone()
-        if row is None:  # deleted between the eligibility read and this one
-            continue
-        if _dispatch_lane_task(conn, row, row["assignee"], result, lane="ready",
-                               dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
-                               failure_limit=failure_limit, spawn_fn=spawn_fn,
-                               per_profile_cap=per_profile_cap, per_profile_running=running,
-                               eligibility_guard=lambda c, e=entry: eligible(c, e),
-                               reviewed_policy=worker_policy(entry)):
-            used += 1
     return result
 
 
@@ -2181,22 +2135,8 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        if reviewed_policy:
-            claimed._reviewed_worker_policy = dict(reviewed_policy)
-            with _kb.write_txn(conn):
-                current = conn.execute("SELECT current_run_id, status FROM tasks WHERE id=?",
-                                       (claimed.id,)).fetchone()
-                if current is None or current["status"] != "running" or current["current_run_id"] != claimed.current_run_id:
-                    raise RuntimeError("reviewed worker claim changed before policy persistence")
-                import json
-                prior = conn.execute("SELECT metadata FROM task_runs WHERE id=?",
-                                     (claimed.current_run_id,)).fetchone()
-                metadata = json.loads(prior["metadata"] or "{}")
-                metadata["reviewed_worker_policy"] = dict(reviewed_policy)
-                conn.execute("UPDATE task_runs SET metadata=? WHERE id=?",
-                             (json.dumps(metadata), claimed.current_run_id))
-                _kb._append_event(conn, claimed.id, "reviewed_worker_policy", reviewed_policy,
-                                  run_id=claimed.current_run_id)
+        from hermes_cli.kanban_dispatch_scope import persist_reviewed_policy
+        persist_reviewed_policy(conn, claimed, reviewed_policy)
         pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
@@ -2853,10 +2793,8 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str], *, qu
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
     cmd.extend(["chat", "--query-file", query_file])
-    policy = getattr(task, "_reviewed_worker_policy", {})
-    if policy:
-        cmd.extend(["--max-turns", str(policy["max_turns"]),
-                    "--run-budget", str(policy["run_budget_seconds"])])
+    from hermes_cli.kanban_dispatch_scope import reviewed_worker_args
+    cmd.extend(reviewed_worker_args(task))
     # query-file feeds the same one-shot path: cli.py runs the judge loop too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
     return cmd
