@@ -24,6 +24,7 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Tuple, TYPE_CHECKING, Union
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from agent.auxiliary_client_anthropic_format import _translate_anthropic_response_format
 from agent.error_classifier import (
     _BILLING_PATTERNS,
     _OVERLOADED_PATTERNS,
@@ -1027,13 +1028,13 @@ def _load_pool_with_credentials(provider: str, note: str = "") -> Optional[Any]:
     return pool if pool and pool.has_credentials() else None
 
 
-def _select_pool_entry(provider: str) -> tuple[bool, Optional[Any]]:
+def _select_pool_entry(provider: str, *, model: Optional[str] = None) -> tuple[bool, Optional[Any]]:
     """Return (pool_exists_for_provider, selected_entry)."""
     pool = _load_pool_with_credentials(provider)
     if pool is None:
         return False, None
     try:
-        return True, pool.select()
+        return True, pool.select(model=model) if model else pool.select()
     except Exception as exc:
         logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
         return True, None
@@ -1671,28 +1672,6 @@ class CodexAuxiliaryClient:
 
 class AsyncCodexAuxiliaryClient(_AsyncAuxiliaryClientBase):
     pass
-
-
-def _translate_anthropic_response_format(anthropic_kwargs: dict[str, Any], response_format: Any) -> None:
-    """Merge an OpenAI response format into Anthropic ``output_config``."""
-    if not isinstance(response_format, dict):
-        return
-    format_type = response_format.get("type")
-    if format_type == "json_schema":
-        json_schema = response_format.get("json_schema")
-        if not isinstance(json_schema, dict) or "schema" not in json_schema:
-            return
-        schema = json_schema["schema"]
-    elif format_type == "json_object":
-        # Anthropic SDK has no schema-less JSON mode; only ``json_schema``.
-        schema = {"type": "object"}
-    else:
-        return
-    output_config = anthropic_kwargs.get("output_config")
-    if not isinstance(output_config, dict):
-        output_config = {}
-        anthropic_kwargs["output_config"] = output_config
-    output_config["format"] = {"type": "json_schema", "schema": schema}
 
 
 class _AnthropicCompletionsAdapter:
@@ -3039,15 +3018,20 @@ def _try_azure_foundry(
 
 
 def _try_anthropic(explicit_api_key: Optional[str | Callable[[], str]] = None,
-                   explicit_base_url: Optional[str] = None) -> tuple[Optional[Any], Optional[str]]:
+                   explicit_base_url: Optional[str] = None, model: Optional[str] = None) -> tuple[Optional[Any], Optional[str]]:
     try:
         from agent.anthropic_adapter import build_anthropic_client
         from agent.anthropic_credentials import resolve_anthropic_token
     except ImportError:
         return None, None
-    pool_present, entry = _select_pool_entry("anthropic")
+    model = model or _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
+    from agent.oauth_account_fallback import enabled
+    fallback_enabled = enabled("anthropic")
+    pool_present, entry = _select_pool_entry("anthropic", model=model) if fallback_enabled else _select_pool_entry("anthropic")
+    if fallback_enabled and entry is None:
+        return None, None  # an ambient key/resolver must not bypass account admission
     if pool_present and entry is not None:
-        token = explicit_api_key or _pool_runtime_api_key(entry)
+        token = _pool_runtime_api_key(entry) if fallback_enabled else explicit_api_key or _pool_runtime_api_key(entry)
     else:
         # Pool absent/empty: legacy resolver so a dead pool entry can't wedge aux tasks when a standalone credential exists.
         entry = None
@@ -3084,7 +3068,6 @@ def _try_anthropic(explicit_api_key: Optional[str | Callable[[], str]] = None,
         base_url = override_url
     from agent.anthropic_credentials import _is_oauth_token
     is_oauth = _is_oauth_token(token)
-    model = _get_aux_model_for_provider("anthropic") or "claude-haiku-4-5-20251001"
     if _aux_probe_active():
         # Probe: token + adapter import resolved; skip real client construction.
         return _AuxProbeClientStub(api_key="", base_url=base_url), model
@@ -3722,7 +3705,7 @@ def _recoverable_pool_provider(
     return None
 
 
-def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str = "") -> bool:
+def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str = "", model: Optional[str] = None) -> bool:
     """Try same-provider credential-pool recovery for auxiliary calls.
 
     ``failed_api_key`` lets mark_exhausted_and_rotate identify the right pool entry even if
@@ -3739,12 +3722,13 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     status_code = getattr(exc, "status_code", None)
 
     def _rotate(fallback_status: int) -> bool:
-        error_context: dict[str, Any] = {"message": str(exc)}
+        from agent.agent_runtime_helpers import extract_api_error_context
+        error_context = extract_api_error_context(exc)
         if status_code is not None:
             error_context["status_code"] = status_code
         next_entry = pool.mark_exhausted_and_rotate(
             status_code=status_code if status_code is not None else fallback_status,
-            error_context=error_context, api_key_hint=failed_api_key or None,
+            error_context=error_context, api_key_hint=failed_api_key or None, model=model,
         )
         if next_entry is None:
             return False
@@ -5281,7 +5265,7 @@ def _resolve_api_key_branch(req: _ResolveRequest, pconfig: Any, resolve_creds: C
     provider = req.provider
     if provider == "anthropic":
         client, default_model = _try_anthropic(explicit_api_key=req.explicit_api_key,
-                                               explicit_base_url=req.explicit_base_url)
+                                               explicit_base_url=req.explicit_base_url, model=req.model)
         return _route_or_warn(req, client, default_model,
                               "resolve_provider_client: anthropic requested but no Anthropic credentials found")
     creds = resolve_creds(provider)
@@ -5563,7 +5547,7 @@ _STRICT_VISION_BACKENDS: dict[str, Callable[[Optional[str]], tuple[Optional[Any]
     "openrouter": lambda model: _try_openrouter(model=model),
     "nous": lambda model: resolve_provider_client("nous", model, is_vision=True),
     "openai-codex": lambda model: resolve_provider_client("openai-codex", model, is_vision=True),
-    "anthropic": lambda model: _try_anthropic(),
+    "anthropic": lambda model: _try_anthropic(model=model),
     "deepinfra": _deepinfra_strict_vision_backend,
     "custom": lambda model: _try_custom_endpoint(),
 }
@@ -7818,7 +7802,7 @@ def _ladder_credential_rungs(
                 _LadderStep("call", (client, kwargs)), _credential_rung_accepts)
             if recovery_err is None:
                 return resp, None
-        if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key):
+        if _recover_provider_pool(pool_provider, recovery_err, failed_api_key=_client_api_key, model=route.resolved_model or route.final_model):
             logger.info("Auxiliary %s%s: recovered %s via credential-pool rotation after %s",
                         task or "call", tag, pool_provider, type(recovery_err).__name__)
             try:
@@ -7829,7 +7813,7 @@ def _ladder_credential_rungs(
                 # then fall through to the provider fallback.
                 if (_is_payment_error(retry2_err) or _is_auth_error(retry2_err)
                         or _is_rate_limit_error(retry2_err)):
-                    _recover_provider_pool(pool_provider, retry2_err)
+                    _recover_provider_pool(pool_provider, retry2_err, model=route.resolved_model or route.final_model)
                     first_err = retry2_err
                 else:
                     raise

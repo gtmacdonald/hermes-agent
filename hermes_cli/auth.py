@@ -981,7 +981,7 @@ _POOL_TOKEN_GENERATION_FIELDS = (
     "agent_key_obtained_at", "agent_key_reused",
     # Refresh-coupled metadata: a Nous refresh rewrites scope and the validated
     # inference route together with the new pair, so they travel with it.
-    "scope", "inference_base_url",
+    "scope", "inference_base_url", "oauth_account_identity",
 )
 
 

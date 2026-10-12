@@ -435,6 +435,8 @@ def _add_credential(args, provider: str, pool, requested_type: str) -> PooledCre
         provider=provider, id=uuid.uuid4().hex[:6], label=label, auth_type=spec.auth_type, priority=0,
         source=spec.source(creds) if callable(spec.source) else spec.source,
         access_token=token, **spec.fields(creds, provider))
+    if provider == "anthropic" and creds.get("oauth_account_identity"):
+        entry.extra["oauth_account_identity"] = creds["oauth_account_identity"]
     existing = pool.entries()
     entry = pool.add_entry(entry)
     # The first Codex/xAI credential becomes the active provider (as the old singleton save path
